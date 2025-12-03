@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request
 import logging
 
+from sqlalchemy import inspect
+
 from database.models import Base
 from database.session import engine, SessionLocal
 from database import crud
@@ -30,6 +32,13 @@ def on_startup():
 @app.get("/")
 def root():
     return {"message": "GiftCard backend działa!"}
+
+
+# 🔍 endpoint debugowy – pokazuje nazwy tabel w bazie
+@app.get("/debug/tables")
+def list_tables():
+    inspector = inspect(engine)
+    return inspector.get_table_names()
 
 
 @app.post("/webhook/order")
@@ -141,20 +150,11 @@ async def webhook_order(request: Request):
                     continue
 
                 used = crud.mark_code_used(db, code_obj, order_id)
-                assigned_codes.append(
-                    {
-                        "code": used.code,
-                        "value": used.value,
-                    }
-                )
+                assigned_codes.append({"code": used.code, "value": used.value})
     finally:
         db.close()
 
-    logger.info(
-        "Przypisane kody dla zamówienia %s: %s",
-        order_id,
-        assigned_codes,
-    )
+    logger.info("Przypisane kody dla zamówienia %s: %s", order_id, assigned_codes)
 
     # TU później:
     # - generowanie PDF dla każdego kodu
