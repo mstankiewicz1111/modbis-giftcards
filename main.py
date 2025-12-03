@@ -1,8 +1,9 @@
+from fastapi import FastAPI, Request
+import logging
+
 from database.models import Base
 from database.session import engine, SessionLocal
 from database import crud
-from fastapi import FastAPI, Request
-import logging
 
 app = FastAPI()
 
@@ -18,14 +19,18 @@ SIZE_TO_VALUE = {
     "200 zł": 200,
     "300 zł": 300,
 }
+
+
 @app.on_event("startup")
 def on_startup():
     # Utworzy tabelę gift_codes, jeśli jeszcze nie istnieje
     Base.metadata.create_all(bind=engine)
 
+
 @app.get("/")
 def root():
     return {"message": "GiftCard backend działa!"}
+
 
 @app.post("/webhook/order")
 async def webhook_order(request: Request):
@@ -43,8 +48,8 @@ async def webhook_order(request: Request):
 
     client_email = (
         order.get("clientResult", {})
-             .get("clientAccount", {})
-             .get("clientEmail")
+        .get("clientAccount", {})
+        .get("clientEmail")
     )
 
     order_details = order.get("orderDetails", {})
@@ -59,13 +64,16 @@ async def webhook_order(request: Request):
     if not is_paid:
         logger.info(
             "Zamówienie %s (%s) NIE jest opłacone – przerywam.",
-            order_id, order_serial
+            order_id,
+            order_serial,
         )
         return {"status": "not_paid", "orderId": order_id}
 
     logger.info(
         "Odebrano OPŁACONE zamówienie: orderId=%s, serial=%s, email=%s",
-        order_id, order_serial, client_email
+        order_id,
+        order_serial,
+        client_email,
     )
 
     # -----------------------------------------
@@ -84,23 +92,27 @@ async def webhook_order(request: Request):
 
             if value is None:
                 logger.warning(
-                    "Znaleziono produkt karty (ID=%s), ale nieznana wartość sizePanelName=%s",
-                    product_id, size
+                    "Znaleziono produkt karty (ID=%s), "
+                    "ale nieznana wartość sizePanelName=%s",
+                    product_id,
+                    size,
                 )
                 continue
 
-            gift_lines.append({
-                "product_id": product_id,
-                "quantity": quantity,
-                "name": name,
-                "size": size,
-                "value": value,
-            })
+            gift_lines.append(
+                {
+                    "product_id": product_id,
+                    "quantity": quantity,
+                    "name": name,
+                    "size": size,
+                    "value": value,
+                }
+            )
 
-        if not gift_lines:
+    if not gift_lines:
         logger.info(
             "Opłacone zamówienie %s nie zawiera kart podarunkowych – ignoruję.",
-            order_id
+            order_id,
         )
         return {"status": "no_giftcards", "orderId": order_id}
 
@@ -123,21 +135,25 @@ async def webhook_order(request: Request):
                 if not code_obj:
                     logger.error(
                         "Brak wolnych kodów dla wartości %s zł (zamówienie %s)",
-                        value, order_id
+                        value,
+                        order_id,
                     )
                     continue
 
                 used = crud.mark_code_used(db, code_obj, order_id)
-                assigned_codes.append({
-                    "code": used.code,
-                    "value": used.value,
-                })
+                assigned_codes.append(
+                    {
+                        "code": used.code,
+                        "value": used.value,
+                    }
+                )
     finally:
         db.close()
 
     logger.info(
         "Przypisane kody dla zamówienia %s: %s",
-        order_id, assigned_codes
+        order_id,
+        assigned_codes,
     )
 
     # TU później:
