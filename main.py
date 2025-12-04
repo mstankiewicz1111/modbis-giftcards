@@ -271,3 +271,21 @@ async def webhook_order(request: Request):
         "giftLines": gift_lines,
         "assignedCodes": assigned_codes,
     }
+
+from fastapi import Query
+
+@app.get("/debug/test-email")
+async def debug_test_email(to: str = Query(..., description="Adres odbiorcy")):
+    """
+    Testowy endpoint wysyłki email — pozwala sprawdzić, czy SMTP działa.
+    """
+    try:
+        send_email(
+            to_email=to,
+            subject="Test wysyłki – Wassyl GiftCard",
+            body_text="To jest testowy email wysłany z backendu karty podarunkowej.",
+            attachments=None
+        )
+        return {"status": "ok", "message": f"Wysłano testową wiadomość na {to}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
