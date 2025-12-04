@@ -53,32 +53,32 @@ def generate_giftcard_pdf(code: str, value: int) -> bytes:
     value_font, code_font = _get_font_names()
 
     # --- POZYCJE TEKSTU (lewy dół to 0,0) ---
-    # delikatnie korygujemy – w prawo i mniejszy font
 
-    # wysokość: zostawiamy mniej więcej jak była
-    value_y = height * 0.235
-    code_y = height * 0.175
+    # była: height * 0.235 -> podnosimy lekko
+    value_y = height * 0.245
 
-    # szerokość: mocniej w prawo
-    value_x = width * 0.55   # wartość bardziej po prawej
-    code_x = width * 0.47    # numer też w prawo
+    # było: width * 0.55 -> przesuwamy LEKKO w lewo
+    value_x = width * 0.52
 
-    # --- Teksty ---
+    # była: height * 0.175 -> minimalnie w dół
+    code_y = height * 0.165
+
+    # było: width * 0.47 -> minimalnie w prawo
+    code_x = width * 0.50
+
+    # --- TEKST + FONT ---
     value_text = f"{value} zł"
     code_text = str(code)
 
-    # jeśli fallback na Helvetica – poprawka na "ł"
     if value_font == "Helvetica":
         value_text = value_text.replace("ł", "l").replace("Ł", "L")
 
-    # 3. Rysowanie tekstu
-
-    # Wartość – mniejszy font
-    c.setFont(value_font, 18)
+    # Wartość — font 16 px
+    c.setFont(value_font, 16)
     c.drawString(value_x, value_y, value_text)
 
-    # Numer karty – jeszcze mniejszy font
-    c.setFont(code_font, 12)
+    # Kod — font 11 px
+    c.setFont(code_font, 11)
     c.drawString(code_x, code_y, code_text)
 
     c.save()
