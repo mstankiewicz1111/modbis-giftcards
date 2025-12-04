@@ -2,8 +2,10 @@ from fastapi import FastAPI, Request
 import logging
 
 from sqlalchemy import inspect
+from pydantic import BaseModel
+from typing import Dict, List
 
-from database.models import Base
+from database.models import Base, GiftCode
 from database.session import engine, SessionLocal
 from database import crud
 
@@ -20,6 +22,7 @@ SIZE_TO_VALUE = {
     "100 zł": 100,
     "200 zł": 200,
     "300 zł": 300,
+    "500 zł": 500,
 }
 
 
@@ -167,3 +170,36 @@ async def webhook_order(request: Request):
         "giftLines": gift_lines,
         "assignedCodes": assigned_codes,
     }
+
+
+# ===== ADMIN: dodawanie wielu pul kodów naraz =====
+
+class AddPoolsRequest(BaseModel):
+    # np. {"100": ["KOD100-1", "KOD100-2"], "200": ["KOD200-1", ...]}
+    pools: Dict[int, List[str]]
+
+
+@app.post("/admin/add-pools")
+def add_pools(req: AddPoolsRequest):
+    db = SessionLocal()
+    total_added = 0
+    details = []
+
+    try:
+        for value, codes in req.pools.items():
+            added_for_value = 0
+            for code in codes:
+                gc = GiftCode(code=code, value=value)
+                db.add(gc)
+                added_for_value += 1
+                total_added += 1
+            details.append({"value": value, "added": added_for_value})
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "details": str(e)}
+    finally:
+        db.close()
+
+    return {"status": "ok", "total_added": total_added, "details": details}
