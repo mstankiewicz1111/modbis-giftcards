@@ -9,6 +9,8 @@ from database.models import Base, GiftCode
 from database.session import engine, SessionLocal
 from database import crud
 
+from pdf_utils import generate_giftcard_pdf  # import generatora PDF
+
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
@@ -97,15 +99,14 @@ async def webhook_order(request: Request):
         product_id = p.get("productId")
         quantity = p.get("productQuantity", 1)
         name = p.get("productName")
-        size = p.get("sizePanelName")  # np. "100 zł", "200 zł", "300 zł"
+        size = p.get("sizePanelName")  # np. "100 zł", "200 zł", "300 zł", "500 zł"
 
         if product_id == GIFT_PRODUCT_ID:
             value = SIZE_TO_VALUE.get(size)
 
             if value is None:
                 logger.warning(
-                    "Znaleziono produkt karty (ID=%s), "
-                    "ale nieznana wartość sizePanelName=%s",
+                    "Znaleziono produkt karty (ID=%s), ale nieznana wartość sizePanelName=%s",
                     product_id,
                     size,
                 )
@@ -159,16 +160,29 @@ async def webhook_order(request: Request):
 
     logger.info("Przypisane kody dla zamówienia %s: %s", order_id, assigned_codes)
 
-    # TU później:
-    # - generowanie PDF dla każdego kodu
-    # - wysłanie maila do client_email
-    # - dopisanie kodów do zamówienia w Idosell
+    # --------------------------------------
+    # 4. Generowanie PDF dla każdego kodu
+    # --------------------------------------
+    generated_pdfs = []
+    for item in assigned_codes:
+        pdf_bytes = generate_giftcard_pdf(
+            code=item["code"],
+            value=item["value"]
+        )
+        generated_pdfs.append({
+            "value": item["value"],
+            "code": item["code"],
+            "pdf_size_bytes": len(pdf_bytes)
+        })
+
+    # (tu możesz podpiąć wysyłkę maila)
 
     return {
         "status": "giftcards_assigned",
         "orderId": order_id,
         "giftLines": gift_lines,
         "assignedCodes": assigned_codes,
+        "generatedPDFs": generated_pdfs,
     }
 
 
