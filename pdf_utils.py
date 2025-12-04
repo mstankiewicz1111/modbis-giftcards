@@ -1,64 +1,73 @@
 import io
-from reportlab.pdfgen import canvas
+import os
+
 from PyPDF2 import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
 
-TEMPLATE_PATH = "GIFTCARD.pdf"
-
-# Rozmiar strony Twojej karty (odczytany z PDF)
-TEMPLATE_WIDTH = 240.75
-TEMPLATE_HEIGHT = 161.04
+# Ścieżka do szablonu PDF (pusty wzór karty)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_PATH = os.path.join(BASE_DIR, "WASSYL-GIFTCARD.pdf")
 
 
 def generate_giftcard_pdf(code: str, value: int) -> bytes:
     """
-    Generuje PDF karty podarunkowej na podstawie szablonu GIFTCARD.pdf.
-    Na pierwszej stronie:
-      - pozostawia grafikę szablonu,
-      - dokłada kod i wartość karty na środku.
-    Zwraca bajty gotowego PDF-a.
+    Generuje pojedynczy plik PDF z kartą podarunkową:
+    - jako tło używa WASSYL-GIFTCARD.pdf
+    - w białym polu wpisuje:
+        * wartość, np. "100 zł"
+        * numer karty (code)
+    Zwraca gotowy PDF jako bytes (do wysłania mailem / zapisania).
     """
 
-    # 1. Wczytujemy szablon do pamięci (bez zostawiania otwartego pliku)
+    # 1. Wczytujemy szablon
     with open(TEMPLATE_PATH, "rb") as f:
         template_bytes = f.read()
 
-    template_stream = io.BytesIO(template_bytes)
-    base_reader = PdfReader(template_stream)
-    base_page = base_reader.pages[0]
+    template_reader = PdfReader(io.BytesIO(template_bytes))
+    base_page = template_reader.pages[0]
 
-    # 2. Tworzymy nakładkę o takim samym rozmiarze jak karta
+    width = float(base_page.mediabox.width)
+    height = float(base_page.mediabox.height)
+
+    # 2. Tworzymy nakładkę z tekstem, o takim samym rozmiarze jak szablon
     packet = io.BytesIO()
-    c = canvas.Canvas(packet, pagesize=(TEMPLATE_WIDTH, TEMPLATE_HEIGHT))
+    c = canvas.Canvas(packet, pagesize=(width, height))
 
-    center_x = TEMPLATE_WIDTH / 2
+    # --- WSPÓŁRZĘDNE TEKSTU (procentowo od wysokości strony) ---
+    # 0,0 = lewy dolny róg
+    #
+    # Wysokości dobrane "na oko" jako procent wysokości strony:
+    value_y = height * 0.27   # trochę powyżej środka białego pola
+    code_y = height * 0.19    # niżej – przy „Numer karty:”
 
-    # Współrzędne dobrane „na oko” – tekst mniej więcej w środku.
-    # Potem można je lekko skorygować po obejrzeniu pierwszego podglądu.
-    CODE_Y = 90   # wyżej
-    VALUE_Y = 60  # niżej
+    # X zostawiamy mniej więcej jak wcześniej – możesz potem skorygować
+    value_x = width * 0.18
+    code_x = width * 0.26
 
-    # Kod karty (np. ABCD-1234-XYZ)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawCentredString(center_x, CODE_Y, code)
+    # 3. Rysujemy wartość i kod
+    value_text = f"{value} zł"
+    code_text = str(code)
 
-    # Wartość karty (np. "300 zł")
-    c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(center_x, VALUE_Y, f"{value} zł")
+    # Wartość – trochę większą czcionką
+    c.setFont("Helvetica-Bold", 22)
+    c.drawString(value_x, value_y, value_text)
+
+    # Numer karty
+    c.setFont("Helvetica", 18)
+    c.drawString(code_x, code_y, code_text)
 
     c.save()
-    packet.seek(0)
 
+    # 4. Łączymy nakładkę z szablonem
+    packet.seek(0)
     overlay_reader = PdfReader(packet)
     overlay_page = overlay_reader.pages[0]
 
-    # 3. Łączymy zawartość strony szablonu z nakładką
     base_page.merge_page(overlay_page)
 
-    # 4. Zapisujemy wynik do nowego PDF-a
     writer = PdfWriter()
     writer.add_page(base_page)
 
-    output = io.BytesIO()
-    writer.write(output)
-
-    return output.getvalue()
+    output_stream = io.BytesIO()
+    writer.write(output_stream)
+    return output_stream.getvalue()
