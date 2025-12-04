@@ -4,12 +4,12 @@ from typing import Union
 from reportlab.pdfgen import canvas
 from PyPDF2 import PdfReader, PdfWriter
 
-TEMPLATE_PATH = "WASSYL-GIFTCARD.pdf"
+TEMPLATE_PATH = "GIFTCARD.pdf"
 
 
 def generate_giftcard_pdf(code: str, value: int, output_path: Union[str, None] = None) -> bytes:
     """
-    Tworzy PDF z kartą podarunkową na bazie szablonu WASSYL-GIFTCARD.pdf.
+    Tworzy PDF z kartą podarunkową na bazie szablonu GIFTCARD.pdf.
     Zwraca bajty PDF (do wysyłki mailem), opcjonalnie zapisuje na dysk jeśli podasz output_path.
     """
 
