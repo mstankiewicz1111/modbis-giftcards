@@ -1,103 +1,125 @@
-# email_utils.py
 import os
 import smtplib
 import ssl
-from email.message import EmailMessage
-from typing import List, Tuple, Dict
 import logging
+from typing import List, Tuple, Optional
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 
-logger = logging.getLogger("giftcard-webhook")
+logger = logging.getLogger("giftcard-email")
+
+# Typ: lista załączników: (nazwa_pliku, bajty)
+AttachmentList = Optional[List[Tuple[str, bytes]]]
 
 
 def _get_smtp_config():
-    """Czyta konfigurację SMTP z environment variables."""
+    """Pobiera konfigurację SMTP ze zmiennych środowiskowych."""
     host = os.getenv("SMTP_HOST")
     port = os.getenv("SMTP_PORT")
     user = os.getenv("SMTP_USER")
     password = os.getenv("SMTP_PASSWORD")
-    sender = os.getenv("SMTP_SENDER")  # adres "From:"
+    sender = os.getenv("SMTP_SENDER")
 
-    if not host or not port or not sender:
-        raise RuntimeError(
-            "Brak konfiguracji SMTP. Ustaw SMTP_HOST, SMTP_PORT i SMTP_SENDER w zmiennych środowiskowych."
-        )
+    if not all([host, port, user, password, sender]):
+        missing = [
+            name
+            for name, value in [
+                ("SMTP_HOST", host),
+                ("SMTP_PORT", port),
+                ("SMTP_USER", user),
+                ("SMTP_PASSWORD", password),
+                ("SMTP_SENDER", sender),
+            ]
+            if not value
+        ]
+        msg = f"Brak wymaganych zmiennych SMTP: {', '.join(missing)}"
+        logger.error(msg)
+        raise RuntimeError(msg)
 
     try:
-        port = int(port)
+        port_int = int(port)
     except ValueError:
-        raise RuntimeError("SMTP_PORT musi być liczbą (np. 587).")
+        raise RuntimeError(f"SMTP_PORT musi być liczbą, aktualnie: {port!r}")
 
-    return host, port, user, password, sender
+    return host, port_int, user, password, sender
+
+
+def send_email(
+    to_email: str,
+    subject: str,
+    body_text: str,
+    attachments: AttachmentList = None,
+) -> None:
+    """
+    Wysyła prostego maila tekstowego z opcjonalnymi załącznikami.
+    """
+    host, port, user, password, sender = _get_smtp_config()
+
+    msg = MIMEMultipart()
+    msg["From"] = sender
+    msg["To"] = to_email
+    msg["Subject"] = subject
+
+    # Treść w UTF-8, żeby np. 'ł' działało
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+    # Załączniki
+    if attachments:
+        for filename, file_bytes in attachments:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(file_bytes)
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f'attachment; filename="{filename}"',
+            )
+            msg.attach(part)
+
+    context = ssl.create_default_context()
+
+    logger.info("Łączenie z serwerem SMTP %s:%s jako %s", host, port, user)
+    with smtplib.SMTP_SSL(host, port, context=context) as server:
+        server.login(user, password)
+        server.sendmail(sender, [to_email], msg.as_string())
+    logger.info("Wysłano e-mail do %s", to_email)
 
 
 def send_giftcard_email(
     to_email: str,
     order_id: str,
-    codes: List[Dict[str, str]],
-    pdf_files: List[Tuple[str, bytes]],
+    codes: List[dict],
+    pdf_files: AttachmentList,
 ) -> None:
     """
-    Wysyła e-mail z kartami podarunkowymi.
-
-    :param to_email: adres klienta
-    :param order_id: ID zamówienia z Idosell
-    :param codes: lista słowników {"code": "...", "value": 300}
-    :param pdf_files: lista (filename, pdf_bytes)
+    Wysyła maila z kartami podarunkowymi (PDF-y w załączniku).
+    `codes` – lista słowników np. {"code": "...", "value": 300}
     """
-    host, port, user, password, sender = _get_smtp_config()
+    subject = f"Wassyl – Twoja karta podarunkowa (zamówienie {order_id})"
 
-    msg = EmailMessage()
-    msg["Subject"] = f"WASSYL – karta podarunkowa (zamówienie {order_id})"
-    msg["From"] = sender
-    msg["To"] = to_email
-
-    # Treść maila – możesz sobie potem ładniej wystylować :)
+    # Prosta treść maila z wypisanymi kodami
     lines = [
-        "Dzień dobry,",
+        "Dziękujemy za zakup karty podarunkowej WASSYL!",
         "",
-        "Dziękujemy za zakup karty podarunkowej WASSYL.",
-        "Poniżej przesyłamy szczegóły:",
+        "Poniżej znajdują się kody kart podarunkowych:",
+    ]
+    for c in codes:
+        lines.append(f"- {c['value']} zł : {c['code']}")
+
+    lines += [
         "",
+        "W załączniku znajdziesz pliki PDF z kartami.",
+        "",
+        "Pozdrawiamy,",
+        "Zespół WASSYL",
     ]
 
-    for c in codes:
-        lines.append(f"- wartość: {c['value']} zł, numer karty: {c['code']}")
+    body_text = "\n".join(lines)
 
-    lines.extend(
-        [
-            "",
-            "W załączniku znajdziesz karty w formacie PDF – gotowe do wydruku lub przesłania dalej.",
-            "",
-            "Pozdrawiamy,",
-            "Zespół WASSYL",
-        ]
+    send_email(
+        to_email=to_email,
+        subject=subject,
+        body_text=body_text,
+        attachments=pdf_files,
     )
-
-    msg.set_content("\n".join(lines))
-
-    # Załączniki PDF
-    for filename, pdf_bytes in pdf_files:
-        msg.add_attachment(
-            pdf_bytes,
-            maintype="application",
-            subtype="pdf",
-            filename=filename,
-        )
-
-    context = ssl.create_default_context()
-
-    logger.info("Wysyłam e-mail z kartą podarunkową do %s", to_email)
-
-    with smtplib.SMTP(host, port) as server:
-        # większość providerów wymaga STARTTLS na porcie 587
-        try:
-            server.starttls(context=context)
-        except smtplib.SMTPException:
-            logger.warning("Nie udało się uruchomić STARTTLS – kontynuuję bez TLS.")
-
-        if user and password:
-            server.login(user, password)
-
-        server.send_message(msg)
-
-    logger.info("E-mail z kartą podarunkową wysłany do %s", to_email)
