@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import Response
 import logging
 import os
@@ -8,7 +8,7 @@ from database.models import Base
 from database.session import engine, SessionLocal
 from database import crud
 from pdf_utils import generate_giftcard_pdf
-from email_utils import send_giftcard_email
+from email_utils import send_giftcard_email, send_email  # <-- TU dodany send_email
 import requests
 
 app = FastAPI()
@@ -46,7 +46,9 @@ def root():
 def debug_tables():
     db = SessionLocal()
     try:
-        result = db.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public';")
+        result = db.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public';"
+        )
         tables = [row[0] for row in result]
     finally:
         db.close()
@@ -272,8 +274,10 @@ async def webhook_order(request: Request):
         "assignedCodes": assigned_codes,
     }
 
-from fastapi import Query
 
+# -------------------------------------------------
+#   Test wysyłki email (bez webhooka)
+# -------------------------------------------------
 @app.get("/debug/test-email")
 async def debug_test_email(to: str = Query(..., description="Adres odbiorcy")):
     """
@@ -284,7 +288,7 @@ async def debug_test_email(to: str = Query(..., description="Adres odbiorcy")):
             to_email=to,
             subject="Test wysyłki – Wassyl GiftCard",
             body_text="To jest testowy email wysłany z backendu karty podarunkowej.",
-            attachments=None
+            attachments=None,
         )
         return {"status": "ok", "message": f"Wysłano testową wiadomość na {to}"}
     except Exception as e:
