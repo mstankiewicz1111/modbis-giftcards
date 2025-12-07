@@ -275,21 +275,28 @@ async def webhook_order(request: Request):
     }
 
 
-# -------------------------------------------------
-#   Test wysyłki email (bez webhooka)
-# -------------------------------------------------
+from fastapi import Query
+
 @app.get("/debug/test-email")
 async def debug_test_email(to: str = Query(..., description="Adres odbiorcy")):
     """
-    Testowy endpoint wysyłki email — pozwala sprawdzić, czy SMTP działa.
+    Testowy endpoint wysyłki email — wysyła testową kartę w PDF jako załącznik.
     """
+    # generujemy testowy PDF z istniejącej funkcji
+    pdf_bytes = generate_giftcard_pdf(code="TEST-1234-ABCD", value=300)
+    attachments = [("test-giftcard.pdf", pdf_bytes)]
+
     try:
         send_email(
             to_email=to,
-            subject="Test wysyłki – Wassyl GiftCard",
-            body_text="To jest testowy email wysłany z backendu karty podarunkowej.",
-            attachments=None,
+            subject="Test wysyłki z załącznikiem – Wassyl GiftCard",
+            body_text=(
+                "To jest testowy email wysłany z backendu karty podarunkowej.\n"
+                "W załączniku znajdziesz przykładową kartę w PDF."
+            ),
+            attachments=attachments,
         )
         return {"status": "ok", "message": f"Wysłano testową wiadomość na {to}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
