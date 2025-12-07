@@ -2,8 +2,8 @@ import os
 import base64
 import requests
 
-# Nadawca – bierzemy z env, jak dotąd
-EMAIL_SENDER = os.getenv("SMTP_SENDER", "kontakt@wowpr.pl")
+# Nadawca – bierzemy z env albo default
+EMAIL_SENDER = os.getenv("SMTP_SENDER", "vouchery@wassyl.pl")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 
 
@@ -47,13 +47,16 @@ def send_email(
                 }
             )
 
+    # Jedyny request do SendGrid
     resp = requests.post(
         "https://api.sendgrid.com/v3/mail/send",
         json=data,
         headers={"Authorization": f"Bearer {SENDGRID_API_KEY}"},
         timeout=10,
     )
-    resp.raise_for_status()
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"SendGrid error {resp.status_code}: {resp.text}")
 
 
 def send_giftcard_email(
@@ -77,6 +80,7 @@ def send_giftcard_email(
     ]
     for c in codes:
         lines.append(f"- {c['value']} zł, kod: {c['code']}")
+
     lines.extend(
         [
             "",
@@ -89,17 +93,10 @@ def send_giftcard_email(
 
     body_text = "\n".join(lines)
 
+    # Tylko jedno wywołanie SendGrid API
     send_email(
         to_email=to_email,
         subject=f"Karta podarunkowa WASSYL – zamówienie {order_id}",
         body_text=body_text,
         attachments=pdf_files,
     )
-    resp = requests.post(
-        "https://api.sendgrid.com/v3/mail/send",
-        json=data,
-        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}"},
-        timeout=10,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"SendGrid error {resp.status_code}: {resp.text}")
