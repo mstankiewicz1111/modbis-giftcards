@@ -76,15 +76,18 @@ def _extract_giftcard_positions(order: Dict[str, Any]) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
 
     order_details = order.get("orderDetails") or {}
-    basket = order_details.get("basket") or []
 
-    for item in basket:
+    # Idosell w Twoim payloadzie używa 'productsResults'
+    products = order_details.get("productsResults") or []
+    # gdyby kiedyś pojawiło się 'basket', też je obsłużymy:
+    if not products:
+        products = order_details.get("basket") or []
+
+    for item in products:
         product_id = item.get("productId")
         if product_id != GIFT_PRODUCT_ID:
             continue
 
-        # Dla Idosell zakładamy, że wariant jest w "sizePanelName",
-        # np. "100 zł", "200 zł", "300 zł", "500 zł"
         size_panel_name = item.get("sizePanelName")
         value = GIFT_VARIANTS.get(size_panel_name)
         if not value:
@@ -95,7 +98,13 @@ def _extract_giftcard_positions(order: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
             continue
 
-        quantity = item.get("quantity", 1)
+        # w productsResults ilość jest w polu 'productQuantity'
+        quantity = (
+            item.get("productQuantity")
+            or item.get("quantity")
+            or 1
+        )
+
         result.append({"value": value, "quantity": quantity})
 
     return result
@@ -128,12 +137,17 @@ async def idosell_order_webhook(request: Request):
     # Obsługa różnych możliwych struktur payloadu z Idosell:
     # 1) {"order": {...}}
     # 2) {"orders": [ {...}, ... ]}
-    # 3) płaski obiekt zawierający orderId i orderSerialNumber
+    # 3) {"Results": [ {...}, ... ]}
+    # 4) płaski obiekt zawierający orderId i orderSerialNumber
     if isinstance(payload, dict):
         if isinstance(payload.get("order"), dict):
             order = payload.get("order")
         elif isinstance(payload.get("orders"), list) and payload["orders"]:
             first = payload["orders"][0]
+            if isinstance(first, dict):
+                order = first
+        elif isinstance(payload.get("Results"), list) and payload["Results"]:
+            first = payload["Results"][0]
             if isinstance(first, dict):
                 order = first
         elif "orderId" in payload and "orderSerialNumber" in payload:
@@ -151,11 +165,28 @@ async def idosell_order_webhook(request: Request):
 
     order_id = order.get("orderId")
     order_serial = order.get("orderSerialNumber")
-    client_email = (
-        (order.get("client") or {})
-        .get("contact", {})
-        .get("email")
-    )
+
+    # Szukanie maila w kilku możliwych miejscach
+    client_email: Optional[str] = None
+
+    # wariant 1: order["client"]["contact"]["email"]
+    client = order.get("client") or {}
+    contact = client.get("contact") or {}
+    if isinstance(contact, dict):
+        client_email = contact.get("email")
+
+    # wariant 2: order["clientResult"]["endClientAccount"]["clientEmail"]
+    if not client_email:
+        client_result = order.get("clientResult") or {}
+        end_client = client_result.get("endClientAccount") or {}
+        if isinstance(end_client, dict):
+            client_email = end_client.get("clientEmail")
+
+    # wariant 3: order["clientResult"]["clientAccount"]["clientEmail"]
+        if not client_email:
+            client_account = client_result.get("clientAccount") or {}
+            if isinstance(client_account, dict):
+                client_email = client_account.get("clientEmail")
 
     logger.info(
         "Odebrano webhook dla zamówienia %s (serial: %s), e-mail klienta: %s",
@@ -163,6 +194,9 @@ async def idosell_order_webhook(request: Request):
         order_serial,
         client_email,
     )
+
+    # ...reszta funkcji bez zmian (sprawdzenie opłacenia, przydział kodów itd.)
+
 
     # 1. Sprawdzamy, czy zamówienie jest opłacone
     if not _is_order_paid(order):
@@ -1197,3 +1231,4 @@ async def admin_add_codes(payload: Dict[str, Any]):
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
+
