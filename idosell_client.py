@@ -1,138 +1,139 @@
-import os
-import logging
-from typing import Optional, List, Dict, Any
+# idosell_client.py
 
-import httpx
+import logging
+from typing import Any
+
+import requests
 
 logger = logging.getLogger("giftcard-webhook")
 
-# Konfiguracja z env
-IDOSELL_DOMAIN = os.getenv("IDOSELL_DOMAIN")  # np. "client5056.idosell.com"
-IDOSELL_API_KEY = os.getenv("IDOSELL_API_KEY")
-IDOSELL_TIMEOUT = float(os.getenv("IDOSELL_TIMEOUT", "10.0"))
-
 
 class IdosellApiError(Exception):
-    """Błąd przy komunikacji z Idosell Admin API."""
-    pass
+    """Błąd zwrócony przez Idosell WebAPI."""
 
 
 class IdosellClient:
     """
-    Klient do Idosell Admin API (v3) – obsługa notatki do zamówienia (orderNote).
-
-    Wymagane zmienne środowiskowe:
-    - IDOSELL_DOMAIN   (np. client5056.idosell.com)
-    - IDOSELL_API_KEY  (klucz API z panelu, używany w nagłówku X-API-KEY)
+    Prosty klient do Idosell WebAPI – aktualnie używany tylko do ustawiania
+    notatki do zamówienia (orderNote) po numerze seryjnym zamówienia.
     """
 
-    def __init__(self) -> None:
-        if not IDOSELL_DOMAIN or not IDOSELL_API_KEY:
-            # NIE podnosimy tego w module, tylko dopiero przy konstruktorze
-            raise RuntimeError(
-                "Brak IDOSELL_DOMAIN lub IDOSELL_API_KEY w zmiennych środowiskowych"
-            )
+    def __init__(self, domain: str, api_key: str, timeout: float = 10.0) -> None:
+        """
+        :param domain: np. "client5056.idosell.com" (może być też z https:// – zostanie obcięte)
+        :param api_key: klucz API (X-API-KEY) z panelu Idosell
+        :param timeout: timeout dla zapytań HTTP w sekundach
+        """
+        # Pozwalamy podać domenę z protokołem albo bez.
+        if domain.startswith("http://") or domain.startswith("https://"):
+            domain = domain.split("://", 1)[1]
+        self.base_url = f"https://{domain.strip('/')}/api/admin/v6/orders/orders"
+        self.timeout = timeout
 
-        self.base_url = f"https://{IDOSELL_DOMAIN}/api/admin/v3"
-        self.timeout = IDOSELL_TIMEOUT
-
-    def _client(self) -> httpx.Client:
-        return httpx.Client(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            headers={
-                "X-API-KEY": IDOSELL_API_KEY,
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
                 "accept": "application/json",
                 "content-type": "application/json",
-            },
+                "X-API-KEY": api_key,
+            }
         )
 
-    # -------------------------------------------------------------------
-    #  POBIERANIE orderNote → GET /orders/orders
-    # -------------------------------------------------------------------
+        logger.info("IdosellClient zainicjalizowany dla domeny %s", domain)
 
-    def get_order_note(self, order_serial_number: int) -> Optional[str]:
+    def _parse_json_safely(self, resp: requests.Response) -> Any:
         """
-        Pobiera aktualną notatkę (orderNote) dla wskazanego zamówienia.
+        Pomocniczo: próba sparsowania JSON-a; w razie problemów zwracamy None.
         """
-        params = {"ordersSerialNumbers": [order_serial_number]}
-
-        with self._client() as c:
-            resp = c.get("/orders/orders", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-        results = data.get("results") or data.get("Results") or {}
-        orders = results.get("orders") or results.get("Orders") or []
-        if not orders:
+        try:
+            return resp.json()
+        except ValueError:
             return None
 
-        return orders[0].get("orderNote")
-
-    # -------------------------------------------------------------------
-    #  NADPISYWANIE orderNote → PUT /orders/orders
-    # -------------------------------------------------------------------
-
-    def set_order_note(self, order_serial_number: int, note: str) -> None:
+    def update_order_note(self, order_serial_number: int | str, note: str) -> None:
         """
-        Ustawia nową notatkę dla zamówienia (nadpisuje poprzednią).
+        Ustawia notatkę do zamówienia (orderNote) dla danego zamówienia.
+
+        Zgodnie z działającym przykładem z Idosell, używamy:
+        - endpointu: /api/admin/v6/orders/orders
+        - pola: orderSerialNumber
+        - pola: orderNote
+        i składni:
+
+        {
+          "params": {
+            "orders": [
+              {
+                "orderSerialNumber": 1836855,
+                "orderNote": "test"
+              }
+            ]
+          }
+        }
         """
-        payload: Dict[str, Any] = {
+        # Spróbujmy zrzutować na int – zgodnie z przykładem API.
+        try:
+            serial_value: int | str = int(order_serial_number)
+        except (TypeError, ValueError):
+            # Gdyby kiedyś numer był alfanumeryczny – wyślemy jako string.
+            serial_value = str(order_serial_number)
+
+        payload = {
             "params": {
                 "orders": [
                     {
-                        "orderSerialNumber": order_serial_number,
+                        "orderSerialNumber": serial_value,
                         "orderNote": note,
                     }
                 ]
             }
         }
 
-        with self._client() as c:
-            resp = c.put("/orders/orders", json=payload)
+        logger.info(
+            "Aktualizuję notatkę zamówienia w Idosell: "
+            "orderSerialNumber=%s, url=%s",
+            order_serial_number,
+            self.base_url,
+        )
 
-        if resp.status_code not in (200, 207):
+        resp = self.session.put(self.base_url, json=payload, timeout=self.timeout)
+
+        if resp.status_code >= 400:
+            # Błąd HTTP – logujemy pełną treść odpowiedzi, żeby łatwo debugować.
+            logger.error(
+                "Idosell API zwrócił błąd HTTP %s dla orderSerialNumber=%s: %s",
+                resp.status_code,
+                order_serial_number,
+                resp.text,
+            )
             raise IdosellApiError(
-                f"HTTP {resp.status_code} przy aktualizacji orderNote: {resp.text}"
+                f"HTTP {resp.status_code} podczas aktualizacji notatki: {resp.text}"
             )
 
-        data = resp.json()
-        results = data.get("results") or {}
-        for r in results.get("ordersResults", []):
-            fault_code = r.get("faultCode")
-            if fault_code not in (None, 0):
-                raise IdosellApiError(
-                    f"Idosell error {fault_code}: {r.get('faultString')}"
-                )
+        data = self._parse_json_safely(resp)
 
-    # -------------------------------------------------------------------
-    #  DOPISYWANIE (append) VOUCHERÓW DO orderNote
-    # -------------------------------------------------------------------
+        # Jeżeli API zwraca strukturę z polami errors – spróbujmy ją wychwycić,
+        # ale nie zakładamy konkretnego kształtu (może być dict, lista itd.).
+        if isinstance(data, dict) and data.get("errors"):
+            logger.error(
+                "Idosell API zwrócił błąd logiczny (dict) dla orderSerialNumber=%s: %s",
+                order_serial_number,
+                data["errors"],
+            )
+            raise IdosellApiError(f"API error: {data['errors']}")
 
-    def append_order_note_with_vouchers(
-        self,
-        order_serial_number: int,
-        vouchers: List[Dict[str, Any]],
-        pdf_url: Optional[str] = None,
-    ) -> None:
-        """
-        Dokleja do istniejącej notatki blok z informacją o kartach podarunkowych.
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("errors"):
+                    logger.error(
+                        "Idosell API zwrócił błąd logiczny (list) dla "
+                        "orderSerialNumber=%s: %s",
+                        order_serial_number,
+                        item["errors"],
+                    )
+                    raise IdosellApiError(f"API error: {item['errors']}")
 
-        vouchers: lista słowników np. {"code": "...", "value": 100}
-        """
-        existing = self.get_order_note(order_serial_number) or ""
-
-        lines: List[str] = ["KARTY PODARUNKOWE:"]
-        for v in vouchers:
-            lines.append(f"- {v['value']} zł – kod: {v['code']}")
-        if pdf_url:
-            lines.append(f"- Link do kart (PDF): {pdf_url}")
-
-        voucher_block = "\n".join(lines)
-
-        if existing.strip():
-            new_note = f"{existing.rstrip()}\n\n---\n{voucher_block}"
-        else:
-            new_note = voucher_block
-
-        self.set_order_note(order_serial_number, new_note)
+        logger.info(
+            "Pomyślnie zaktualizowano notatkę zamówienia %s w Idosell.",
+            order_serial_number,
+        )
