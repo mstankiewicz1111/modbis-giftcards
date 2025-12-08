@@ -1070,18 +1070,19 @@ def admin_stats():
       },
       ...
     ]
+
+    Użycie kodu liczymy po tym, czy order_id jest ustawione (NOT NULL).
     """
     db = SessionLocal()
     try:
-        # można to zrobić czystym SQL-em (dla przejrzystości)
         result = db.execute(
             text(
                 """
                 SELECT
                   value,
                   COUNT(*) AS total,
-                  COUNT(*) FILTER (WHERE used = TRUE) AS used,
-                  COUNT(*) FILTER (WHERE used = FALSE) AS unused
+                  COUNT(order_id) AS used,
+                  COUNT(*) - COUNT(order_id) AS unused
                 FROM gift_codes
                 GROUP BY value
                 ORDER BY value
@@ -1116,6 +1117,8 @@ def admin_list_codes(
 ):
     """
     Zwraca listę ostatnich kodów z możliwością filtrowania.
+
+    Pole 'used' wyliczamy na podstawie tego, czy order_id jest ustawione.
     """
     db = SessionLocal()
     try:
@@ -1128,9 +1131,9 @@ def admin_list_codes(
 
         if used is not None:
             if used == "used":
-                conditions.append("used = TRUE")
+                conditions.append("order_id IS NOT NULL")
             elif used == "unused":
-                conditions.append("used = FALSE")
+                conditions.append("order_id IS NULL")
 
         where_clause = ""
         if conditions:
@@ -1138,7 +1141,7 @@ def admin_list_codes(
 
         query = text(
             f"""
-            SELECT id, code, value, used, order_id
+            SELECT id, code, value, order_id
             FROM gift_codes
             {where_clause}
             ORDER BY id DESC
@@ -1154,7 +1157,8 @@ def admin_list_codes(
                 "id": row.id,
                 "code": row.code,
                 "value": row.value,
-                "used": row.used,
+                # 'used' liczymy po order_id
+                "used": row.order_id is not None,
                 "order_id": row.order_id,
             }
             for row in rows
@@ -1231,4 +1235,5 @@ async def admin_add_codes(payload: Dict[str, Any]):
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
+
 
