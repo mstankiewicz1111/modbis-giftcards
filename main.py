@@ -75,7 +75,7 @@ def debug_tables():
     db = SessionLocal()
     try:
         result = db.execute(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public';"
+            text("SELECT tablename FROM pg_tables WHERE schemaname = 'public';")
         )
         tables = [row[0] for row in result]
     finally:
@@ -1238,3 +1238,4 @@ def admin_panel():
     Prosty frontend administracyjny do zarządzania kodami kart.
     """
     return ADMIN_HTML
+
