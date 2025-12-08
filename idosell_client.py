@@ -1,119 +1,72 @@
-import httpx
-from typing import Optional
+import io
+import os
 
-from .config import settings
+from PyPDF2 import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Szablon karty
+TEMPLATE_PATH = os.path.join(BASE_DIR, "WASSYL-GIFTCARD.pdf")
+
+# Własna czcionka z polskimi znakami
+FONT_PATH = os.path.join(BASE_DIR, "DejaVuSans.ttf")
+FONT_NAME = "DejaVuSans"
 
 
-class IdosellApiError(Exception):
-    pass
+def _get_font_names() -> tuple[str, str]:
+    """
+    Zwraca nazwy czcionek do użycia (value_font, code_font).
+    Jeśli jest DejaVuSans.ttf – rejestrujemy ją i używamy.
+    Jeśli nie – wracamy do Helvetica (ale zamieniamy ł -> l).
+    """
+    if os.path.exists(FONT_PATH):
+        if FONT_NAME not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+        return FONT_NAME, FONT_NAME
+
+    # fallback
+    return "Helvetica", "Helvetica"
 
 
-class IdosellClient:
-    def __init__(self):
-        self.base_url = f"https://{settings.idosell_domain}/api/admin/v3"
-        self.api_key = settings.idosell_api_key
-        self.timeout = settings.idosell_api_timeout
+def generate_giftcard_pdf(code: str, value: int | float | str) -> bytes:
+    """
+    Generuje pojedynczą kartę podarunkową jako PDF.
 
-    def _get_client(self) -> httpx.Client:
-        return httpx.Client(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            headers={
-                "X-API-KEY": self.api_key,
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
+    value może być int/float/str – próba zrzutowania na int.
+    """
+    # 0. Walidacja value
+    try:
+        numeric_value = int(round(float(value)))
+    except (TypeError, ValueError):
+        raise ValueError(f"Nieprawidłowa wartość nominalna karty: {value!r}")
+
+    # 1. Sprawdzenie obecności szablonu
+    if not os.path.exists(TEMPLATE_PATH):
+        raise FileNotFoundError(
+            f"Brak pliku szablonu PDF: {TEMPLATE_PATH}. "
+            "Upewnij się, że WASSYL-GIFTCARD.pdf jest w katalogu aplikacji."
         )
 
-    # -------------------------------------------------------------------
-    #  POBIERANIE orderNote → GET /orders/orders
-    # -------------------------------------------------------------------
+    # 2. Wczytanie szablonu
+    with open(TEMPLATE_PATH, "rb") as f:
+        template_bytes = f.read()
 
-    def get_order_note(self, order_serial_number: int) -> Optional[str]:
-        params = {"ordersSerialNumbers": [order_serial_number]}
+    template_reader = PdfReader(io.BytesIO(template_bytes))
+    base_page = template_reader.pages[0]
 
-        with self._get_client() as client:
-            resp = client.get("/orders/orders", params=params)
-            resp.raise_for_status()
-            data = resp.json()
+    width = float(base_page.mediabox.width)
+    height = float(base_page.mediabox.height)
 
-        results = data.get("results") or data.get("Results")
-        if not results:
-            return None
+    # 3. Przygotowanie nakładki
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(width, height))
 
-        orders = (
-            results.get("orders")
-            or results.get("Orders")
-            or []
-        )
-        if not orders:
-            return None
+    value_font, code_font = _get_font_names()
 
-        return orders[0].get("orderNote")
+    # --- POZYCJE TEKSTU (lewy dół to 0,0) ---
 
-    # -------------------------------------------------------------------
-    #  NADPISYWANIE orderNote → PUT /orders/orders
-    # -------------------------------------------------------------------
-
-    def set_order_note(self, order_serial_number: int, note: str) -> None:
-        payload = {
-            "params": {
-                "orders": [
-                    {
-                        "orderSerialNumber": order_serial_number,
-                        "orderNote": note,
-                    }
-                ]
-            }
-        }
-
-        with self._get_client() as client:
-            resp = client.put("/orders/orders", json=payload)
-
-        if resp.status_code not in (200, 207):
-            raise IdosellApiError(
-                f"HTTP {resp.status_code}: {resp.text}"
-            )
-
-        data = resp.json()
-        results = data.get("results") or {}
-
-        # Sprawdzenie błędów per zamówienie
-        for r in results.get("ordersResults", []):
-            fault = r.get("faultCode")
-            if fault not in (None, 0):
-                raise IdosellApiError(
-                    f"Idosell error {fault}: {r.get('faultString')}"
-                )
-
-    # -------------------------------------------------------------------
-    #  DOPISYWANIE VOUCHERA DO orderNote
-    # -------------------------------------------------------------------
-
-    def append_order_note_with_voucher(
-        self,
-        order_serial_number: int,
-        voucher_code: str,
-        value: float,
-        currency: str,
-        pdf_url: Optional[str] = None,
-    ) -> None:
-
-        existing = self.get_order_note(order_serial_number) or ""
-
-        voucher_lines = [
-            "KARTA PODARUNKOWA:",
-            f"– Kod: {voucher_code}",
-            f"– Wartość: {value:.2f} {currency}",
-        ]
-        if pdf_url:
-            voucher_lines.append(f"– Link do PDF: {pdf_url}")
-
-        voucher_block = "\n".join(voucher_lines)
-
-        if existing.strip():
-            new_note = f"{existing.rstrip()}\n\n---\n{voucher_block}"
-        else:
-            new_note = voucher_block
-
-        self.set_order_note(order_serial_number, new_note)
+    # była: height * 0.235 -> podnosimy lekko
+    value_y =_
