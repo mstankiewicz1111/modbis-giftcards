@@ -10,7 +10,7 @@ class IdosellApiError(Exception):
 
 class IdosellClient:
     def __init__(self):
-        self.base_url = f"https://{settings.idosell_domain}/api/admin/v3"  # zgodnie z przykładem
+        self.base_url = f"https://{settings.idosell_domain}/api/admin/v3"
         self.api_key = settings.idosell_api_key
         self.timeout = settings.idosell_api_timeout
 
@@ -26,38 +26,41 @@ class IdosellClient:
         )
 
     # -------------------------------------------------------------------
-    #  POBIERANIE ORDER NOTE (GET /orders/orders)
+    #  POBIERANIE orderNote → GET /orders/orders
     # -------------------------------------------------------------------
 
-    def get_order_note(self, order_id: str) -> Optional[str]:
-        params = {"orderIds": [order_id]}
+    def get_order_note(self, order_serial_number: int) -> Optional[str]:
+        params = {"ordersSerialNumbers": [order_serial_number]}
 
         with self._get_client() as client:
             resp = client.get("/orders/orders", params=params)
             resp.raise_for_status()
             data = resp.json()
 
-        # wyniki zwykle są w `results` -> `orders`
         results = data.get("results") or data.get("Results")
         if not results:
             return None
 
-        orders = results.get("orders") or results.get("Orders")
+        orders = (
+            results.get("orders")
+            or results.get("Orders")
+            or []
+        )
         if not orders:
             return None
 
         return orders[0].get("orderNote")
 
     # -------------------------------------------------------------------
-    #  NADPISYWANIE ORDER NOTE (PUT /orders/orders)
+    #  NADPISYWANIE orderNote → PUT /orders/orders
     # -------------------------------------------------------------------
 
-    def set_order_note(self, order_id: str, note: str) -> None:
+    def set_order_note(self, order_serial_number: int, note: str) -> None:
         payload = {
             "params": {
                 "orders": [
                     {
-                        "orderId": order_id,
+                        "orderSerialNumber": order_serial_number,
                         "orderNote": note,
                     }
                 ]
@@ -68,32 +71,35 @@ class IdosellClient:
             resp = client.put("/orders/orders", json=payload)
 
         if resp.status_code not in (200, 207):
-            raise IdosellApiError(f"HTTP {resp.status_code}: {resp.text}")
+            raise IdosellApiError(
+                f"HTTP {resp.status_code}: {resp.text}"
+            )
 
         data = resp.json()
         results = data.get("results") or {}
 
-        # Idosell zwraca błędy per zamówienie (faultCode / faultString)
-        for result in results.get("ordersResults", []):
-            if result.get("faultCode") not in (None, 0):
+        # Sprawdzenie błędów per zamówienie
+        for r in results.get("ordersResults", []):
+            fault = r.get("faultCode")
+            if fault not in (None, 0):
                 raise IdosellApiError(
-                    f"Idosell error {result.get('faultCode')}: {result.get('faultString')}"
+                    f"Idosell error {fault}: {r.get('faultString')}"
                 )
 
     # -------------------------------------------------------------------
-    #  DOPISYWANIE VOUCHERA DO NOTATKI
+    #  DOPISYWANIE VOUCHERA DO orderNote
     # -------------------------------------------------------------------
 
     def append_order_note_with_voucher(
         self,
-        order_id: str,
+        order_serial_number: int,
         voucher_code: str,
         value: float,
         currency: str,
         pdf_url: Optional[str] = None,
     ) -> None:
 
-        existing = self.get_order_note(order_id) or ""
+        existing = self.get_order_note(order_serial_number) or ""
 
         voucher_lines = [
             "KARTA PODARUNKOWA:",
@@ -110,4 +116,4 @@ class IdosellClient:
         else:
             new_note = voucher_block
 
-        self.set_order_note(order_id, new_note)
+        self.set_order_note(order_serial_number, new_note)
