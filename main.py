@@ -10,9 +10,9 @@ from sqlalchemy import text
 from database.models import Base
 from database.session import engine, SessionLocal
 from database import crud
-from pdf_utils import generate_giftcard_pdf
+from pdf_utils import generate_giftcard_pdf, TEMPLATE_PATH
 from email_utils import send_giftcard_email, send_email
-import requests
+from idosell_client import IdosellClient, IdosellApiError
 
 app = FastAPI()
 
@@ -30,12 +30,14 @@ SIZE_TO_VALUE = {
     "500 zł": 500,
 }
 
+
 class AdminAddCodesPayload(BaseModel):
     value: int
     codes: List[str]
 
+
 # Globalny klient Idosell – inicjalizowany przy starcie aplikacji
-idosell_client: IdosellClient | None = None
+idosell_client = None  # type: ignore[assignment]
 
 
 @app.on_event("startup")
@@ -415,6 +417,7 @@ async def debug_test_email(to: str = Query(..., description="Adres odbiorcy")):
         logger.exception("Błąd przy wysyłaniu testowego maila: %s", e)
         return {"status": "error", "message": str(e)}
 
+
 @app.post("/admin/api/codes")
 def admin_add_codes(payload: AdminAddCodesPayload):
     """
@@ -457,6 +460,7 @@ def admin_add_codes(payload: AdminAddCodesPayload):
         "inserted": inserted,
         "skipped": skipped,
     }
+
 
 @app.get("/admin/api/codes")
 def admin_list_codes(
@@ -524,6 +528,7 @@ def admin_list_codes(
 
     return {"items": items}
 
+
 @app.get("/admin/api/stats")
 def admin_stats():
     """
@@ -556,6 +561,7 @@ def admin_stats():
         db.close()
 
     return {"stats": stats}
+
 
 ADMIN_HTML = """
 <!DOCTYPE html>
@@ -1225,11 +1231,10 @@ DEF-456-UVW"></textarea>
 </html>
 """
 
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     """
     Prosty frontend administracyjny do zarządzania kodami kart.
     """
     return ADMIN_HTML
-
-
