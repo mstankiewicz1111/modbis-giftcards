@@ -209,7 +209,7 @@ def send_giftcard_email(
     UWAGA: dodano order_serial → wstawiany do HTML.
     """
 
-    subject = f"Twoja karta podarunkowa – zamówienie {order_id}"
+    subject = f"Twoja karta podarunkowa – zamówienie {order_serial}"
 
     # tekst jako fallback
     lines = [
