@@ -20,11 +20,14 @@ SENDGRID_API_KEY: Optional[str] = os.getenv("SENDGRID_API_KEY")
 SENDGRID_FROM_EMAIL: str = (
     os.getenv("EMAIL_FROM")
     or os.getenv("SENDGRID_FROM_EMAIL")
-    or "giftcard@wassyl.pl"
+    or "vouchery@wassyl.pl"
 )
 SENDGRID_FROM_NAME: str = os.getenv("SENDGRID_FROM_NAME", "Wassyl")
 
 SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
+
+# Log pomocniczy, żeby w logach startowych było widać, jaki FROM faktycznie używamy
+logger.info("SendGrid FROM email skonfigurowany jako: %r", SENDGRID_FROM_EMAIL)
 
 
 # ------------------------------------------------------------------------------
@@ -195,6 +198,14 @@ def _build_giftcard_html(order_serial_number: str) -> str:
   </body>
 </html>
     """.strip()
+
+
+def build_giftcard_html(order_serial_number: str) -> str:
+    """
+    Publiczny helper – ten HTML możesz wykorzystać również w debug/test-email,
+    żeby testowy mail wyglądał identycznie jak produkcyjny.
+    """
+    return _build_giftcard_html(order_serial_number)
 
 
 # ------------------------------------------------------------------------------
