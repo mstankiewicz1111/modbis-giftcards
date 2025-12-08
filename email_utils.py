@@ -1,249 +1,277 @@
 import os
 import logging
 import base64
-from typing import List, Tuple, Dict, Optional
+import time
+from typing import List, Tuple, Dict, Any, Optional
 
 import requests
 
+from pdf_utils import generate_giftcard_pdf
+
 logger = logging.getLogger("giftcard-webhook")
 
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "kontakt@wowpr.pl")
-SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "Wassyl")
+# ------------------------------------------------------------------------------
+# Konfiguracja SendGrid
+# ------------------------------------------------------------------------------
+
+SENDGRID_API_KEY: Optional[str] = os.getenv("SENDGRID_API_KEY")
+
+# Wsparcie zarówno dla EMAIL_FROM, jak i SENDGRID_FROM_EMAIL
+SENDGRID_FROM_EMAIL: str = (
+    os.getenv("EMAIL_FROM")
+    or os.getenv("SENDGRID_FROM_EMAIL")
+    or "giftcard@wassyl.pl"
+)
+SENDGRID_FROM_NAME: str = os.getenv("SENDGRID_FROM_NAME", "Wassyl")
 
 SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
 
 
-def _build_attachments(attachments: List[Tuple[str, bytes]]) -> List[Dict[str, str]]:
-    result: List[Dict[str, str]] = []
-    for filename, content in attachments:
-        result.append(
-            {
-                "content": base64.b64encode(content).decode("ascii"),
-                "type": "application/pdf",
-                "filename": filename,
-                "disposition": "attachment",
-            }
-        )
-    return result
+# ------------------------------------------------------------------------------
+# Niskopoziomowa funkcja do wysyłania maili przez SendGrid Web API v3
+# ------------------------------------------------------------------------------
 
 
 def send_email(
     to_email: str,
     subject: str,
-    body_text: Optional[str] = None,
+    body_text: str,
     body_html: Optional[str] = None,
     attachments: Optional[List[Tuple[str, bytes]]] = None,
 ) -> None:
+    """
+    Wysyła wiadomość e-mail przy użyciu SendGrid Web API v3.
+
+    :param to_email: adres odbiorcy
+    :param subject: temat wiadomości
+    :param body_text: treść w formacie text/plain
+    :param body_html: treść w formacie text/html (opcjonalnie)
+    :param attachments: lista załączników (nazwa_pliku, zawartość_bytes)
+    """
     if not SENDGRID_API_KEY:
-        raise RuntimeError("Brak SENDGRID_API_KEY w zmiennych środowiskowych")
+        logger.error("Brak SENDGRID_API_KEY – nie można wysłać e-maila.")
+        raise RuntimeError("SENDGRID_API_KEY is not configured")
 
-    content: List[Dict[str, str]] = []
-    if body_text:
-        content.append({"type": "text/plain", "value": body_text})
-    if body_html:
-        content.append({"type": "text/html", "value": body_html})
+    if body_html is None:
+        body_html = f"<pre>{body_text}</pre>"
 
-    if not content:
-        raise ValueError("Musisz podać body_text lub body_html")
-
-    data: Dict = {
-        "personalizations": [{"to": [{"email": to_email}]}],
-        "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
-        "subject": subject,
-        "content": content,
+    data: Dict[str, Any] = {
+        "personalizations": [
+            {
+                "to": [{"email": to_email}],
+                "subject": subject,
+            }
+        ],
+        "from": {
+            "email": SENDGRID_FROM_EMAIL,
+            "name": SENDGRID_FROM_NAME,
+        },
+        "content": [
+            {
+                "type": "text/plain",
+                "value": body_text,
+            },
+            {
+                "type": "text/html",
+                "value": body_html,
+            },
+        ],
     }
 
     if attachments:
-        data["attachments"] = _build_attachments(attachments)
+        sg_attachments: List[Dict[str, Any]] = []
+        for filename, file_bytes in attachments:
+            encoded = base64.b64encode(file_bytes).decode("ascii")
+            sg_attachments.append(
+                {
+                    "content": encoded,
+                    "type": "application/pdf",
+                    "filename": filename,
+                    "disposition": "attachment",
+                }
+            )
+        data["attachments"] = sg_attachments
 
     headers = {
         "Authorization": f"Bearer {SENDGRID_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(SENDGRID_API_URL, json=data, headers=headers, timeout=10)
-    try:
+    logger.info("Wysyłanie e-maila do %s przez SendGrid...", to_email)
+
+    resp = requests.post(SENDGRID_API_URL, json=data, headers=headers, timeout=15)
+
+    if resp.status_code >= 400:
+        logger.error(
+            "Błąd SendGrid: %s – %s",
+            resp.status_code,
+            resp.text,
+        )
         resp.raise_for_status()
-    except Exception as e:
-        logger.error("Błąd przy wysyłce maila SendGrid: %s, response=%s", e, resp.text)
-        raise
 
-    logger.info("Wysłano e-mail na %s (SendGrid)", to_email)
+    logger.info("E-mail do %s został pomyślnie wysłany.", to_email)
 
 
-def _build_giftcard_html(order_serial: str) -> str:
+# ------------------------------------------------------------------------------
+# Budowa HTML dla maila z kartą podarunkową
+# ------------------------------------------------------------------------------
+
+
+def _build_giftcard_html(order_serial_number: str) -> str:
     """
-    Tworzy finalny HTML maila — wklejony szablon + wstawiany numer orderSerialNumber.
+    Buduje HTML dla maila z kartą podarunkową.
+    Layout prosty, ale zgodny z wymaganiami:
+    - logotyp WASSYL
+    - treść po polsku
+    - numer zamówienia (orderSerialNumber)
     """
-
-    return f'''<!DOCTYPE html>
+    return f"""
+<!DOCTYPE html>
 <html lang="pl">
-<head>
-  <meta charset="UTF-8" />
-  <title>Karta podarunkowa WASSYL</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Roboto+Condensed:wght@400;700&display=swap');
-    body {{ margin: 0; padding: 0; background-color: #ffffff; }}
-    img {{ display: block; max-width: 100%; height: auto; }}
-    table {{ border-collapse: collapse; }}
-    .email-container {{ width: 960px; max-width: 960px; }}
-    .body-text {{
-        font-family: 'Roboto Condensed', Arial, sans-serif;
-        font-size: 14px;
-        line-height: 1.6;
-        color: #000000;
-    }}
-    .section-divider {{ border-top: 1px solid #bfbfbf; }}
-    .heading {{
-        font-family: 'Roboto Condensed', Arial, sans-serif;
-        font-size: 14px;
-        font-weight: 700;
-    }}
-    @media only screen and (max-width: 600px) {{
-        .email-container {{ width: 90% !important; }}
-    }}
-  </style>
-</head>
-<body>
-  <table width="100%" cellspacing="0" cellpadding="0" align="center">
-    <tr>
-      <td align="center" style="padding: 24px 0;">
-        <table class="email-container" cellspacing="0" cellpadding="0" align="center">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Twoja karta podarunkowa – zamówienie {order_serial_number}</title>
+  </head>
+  <body style="margin:0; padding:0; background:#f3f4f6; font-family:system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6; padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px; background:#ffffff; border-radius:12px; overflow:hidden; box-shadow:0 12px 30px rgba(15,23,42,0.08);">
+            <tr>
+              <td align="center" style="padding:24px 24px 16px 24px; border-bottom:1px solid #e5e7eb;">
+                <img src="https://wassyl.pl/data/include/cms/gfx/logo-wassyl.png" alt="WASSYL" style="display:block; max-width:180px; height:auto;" />
+              </td>
+            </tr>
 
-          <tr><td><div class="section-divider"></div></td></tr>
+            <tr>
+              <td style="padding:24px 24px 4px 24px; font-size:16px; font-weight:600; color:#111827;">
+                Dziękujemy za zakup karty podarunkowej WASSYL
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 24px 12px 24px; font-size:14px; line-height:1.6; color:#4b5563;">
+                W załączniku przesyłamy Twoją kartę (lub karty) podarunkową w formacie PDF – możesz ją wydrukować
+                lub przesłać dalej osobie obdarowanej.
+              </td>
+            </tr>
 
-          <tr>
-            <td align="center" style="padding: 24px 0 16px 0;">
-              <img src="https://wassyl.pl/data/include/cms/gfx/logo-wassyl.png" alt="WASSYL" />
-            </td>
-          </tr>
+            <tr>
+              <td style="padding:0 24px 16px 24px;">
+                <div style="background:#f9fafb; border-radius:10px; padding:12px 14px; border:1px solid #e5e7eb; font-size:13px; color:#374151;">
+                  <div style="text-transform:uppercase; letter-spacing:0.09em; font-size:11px; color:#9ca3af; margin-bottom:4px;">
+                    Numer zamówienia
+                  </div>
+                  <div style="font-weight:600; letter-spacing:0.02em;">{order_serial_number}</div>
+                </div>
+              </td>
+            </tr>
 
-          <tr><td><div class="section-divider"></div></td></tr>
+            <tr>
+              <td style="padding:0 24px 12px 24px; font-size:14px; line-height:1.6; color:#4b5563;">
+                <strong>Jak skorzystać z karty?</strong><br/>
+                Podczas składania zamówienia w sklepie <a href="https://wassyl.pl" style="color:#4f46e5; text-decoration:none;">WASSYL.pl</a>
+                wybierz metodę płatności „Karta podarunkowa” i wpisz numer karty podarunkowej z załączonego PDF.
+              </td>
+            </tr>
 
-          <tr>
-            <td style="padding: 32px 0 8px 0;">
-              <table width="100%">
-                <tr>
-                  <td class="body-text" style="padding: 0 32px;">
-                    <p>Cześć!</p>
-                    <p>
-                        Dziękujemy za zakup naszej karty podarunkowej. W załączeniu tej wiadomości
-                        znajdziesz plik w formacie PDF do samodzielnego wydruku karty.
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
+            <tr>
+              <td style="padding:0 24px 24px 24px; font-size:13px; line-height:1.6; color:#6b7280;">
+                W razie pytań dotyczących zamówienia lub problemów z realizacją karty, skontaktuj się z nami
+                odpowiadając na tę wiadomość lub poprzez formularz kontaktowy w sklepie.
+              </td>
+            </tr>
 
-          <tr><td><div class="section-divider"></div></td></tr>
+            <tr>
+              <td style="padding:0 24px 24px 24px; font-size:13px; color:#4b5563;">
+                Pozdrawiamy,<br/>
+                <strong>zespół WASSYL.pl</strong>
+              </td>
+            </tr>
 
-          <tr>
-            <td style="padding: 24px 0;">
-              <table width="100%">
-                <tr>
-                  <td class="body-text" style="padding: 0 32px;">
-                    <p class="heading">Jak skorzystać z karty podarunkowej?</p>
-                    <p>
-                        Wystarczy, że podczas składania zamówienia w sklepie
-                        <strong>WASSYL.pl</strong> wybierzesz jako metodę płatności opcję
-                        „Karta podarunkowa”. W następnym kroku musisz po prostu podać numer karty.
-                        Wartość zamówienia zostanie automatycznie pomniejszona. Jeśli nie wykorzystasz
-                        wszystkich środków przypisanych do karty, możesz skorzystać z niej ponownie,
-                        przy kolejnym zamówieniu.
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+    """.strip()
 
-          <tr><td><div class="section-divider"></div></td></tr>
 
-          <tr>
-            <td style="padding: 24px 0 32px 0;">
-              <table width="100%">
-                <tr>
-                  <td class="body-text" style="padding: 0 32px;">
-                    <p>
-                      Masz jakieś pytania? Coś nie zadziałało?
-                      Pisz śmiało na
-                      <a href="mailto:bok@wassyl.pl" style="font-weight:700; color:#000;">
-                        bok@wassyl.pl
-                      </a>!
-                    </p>
-
-                    <p>
-                      W celu ułatwienia komunikacji z nami, podaj nam numer zamówienia
-                      na zakup karty podarunkowej. W Twoim przypadku ten numer brzmi:
-                      <strong>{order_serial}</strong>.
-                    </p>
-
-                    <p>Pozdrawiamy,</p>
-                    <p><strong>zespół WASSYL.pl</strong></p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>'''
+# ------------------------------------------------------------------------------
+# Wysokopoziomowa funkcja do wysyłania kart podarunkowych
+# ------------------------------------------------------------------------------
 
 
 def send_giftcard_email(
     to_email: str,
-    order_id: str,
-    order_serial: str,
-    codes: List[Dict[str, str]],
-    pdf_files: List[Tuple[str, bytes]],
+    codes: List[Dict[str, Any]],
+    order_serial_number: str,
 ) -> None:
     """
     Wysyła maila z kartami podarunkowymi.
-    UWAGA: dodano order_serial → wstawiany do HTML.
+
+    - generuje PDF dla każdej karty na bazie szablonu WASSYL-GIFTCARD.pdf
+    - dołącza wszystkie PDF-y jako załączniki
+    - w treści maila umieszcza listę kart + numer zamówienia (orderSerialNumber)
+    - opóźnia wysyłkę o 3 minuty (żeby najpierw przyszły maile ze sklepu)
     """
 
-    subject = f"Twoja karta podarunkowa – zamówienie {order_serial}"
+    # OPÓŹNIENIE WYSYŁKI – 3 minuty
+    delay_seconds = 3 * 60
+    logger.info(
+        "Zaplanowano wysyłkę e-maila z kartą/kartami do %s za %s sekund.",
+        to_email,
+        delay_seconds,
+    )
+    time.sleep(delay_seconds)
 
-    # tekst jako fallback
-    lines = [
+    subject = f"Twoja karta podarunkowa – zamówienie {order_serial_number}"
+
+    # Tekst jako fallback (plain text)
+    lines: List[str] = [
         "Cześć!",
         "",
         "Dziękujemy za zakup naszej karty podarunkowej.",
-        "W załączeniu przesyłamy PDF do samodzielnego wydruku.",
+        "W załączeniu przesyłamy plik PDF z kartą (lub kartami) do samodzielnego wydruku.",
         "",
         "Podsumowanie kart:",
     ]
+
+    attachments: List[Tuple[str, bytes]] = []
+
     for c in codes:
-        lines.append(f"- {c['value']} zł – kod: {c['code']}")
+        code = str(c.get("code"))
+        value = c.get("value")
+
+        # Linia do body_text
+        lines.append(f"- {value} zł – kod: {code}")
+
+        # Generacja PDF dla każdej karty
+        pdf_bytes = generate_giftcard_pdf(code=code, value=value)
+        filename = f"WASSYL-GIFTCARD-{value}zl-{code}.pdf"
+        attachments.append((filename, pdf_bytes))
 
     lines.extend(
         [
             "",
             "Jak skorzystać z karty?",
-            "Wystarczy wybrać metodę płatności 'Karta podarunkowa' w sklepie WASSYL.pl "
+            "Wystarczy wybrać metodę płatności „Karta podarunkowa” w sklepie WASSYL.pl "
             "i podać numer karty.",
             "",
             "W celu ułatwienia komunikacji podaj numer zamówienia:",
-            f"Numer zamówienia: {order_serial}",
+            f"Numer zamówienia: {order_serial_number}",
             "",
             "Pozdrawiamy, zespół WASSYL.pl",
         ]
     )
 
     body_text = "\n".join(lines)
-    body_html = _build_giftcard_html(order_serial)
+    body_html = _build_giftcard_html(order_serial_number)
 
     send_email(
         to_email=to_email,
         subject=subject,
         body_text=body_text,
         body_html=body_html,
-        attachments=pdf_files,
+        attachments=attachments,
     )
