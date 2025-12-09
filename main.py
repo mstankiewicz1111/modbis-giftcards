@@ -1249,7 +1249,12 @@ def admin_add_codes(payload: Dict[str, Any]):
             len(codes),
             value,
         )
-        return {"status": "ok", "added": len(codes)}
+        # 'inserted' dla zgodności z frontendem (alert używa data.inserted)
+        return {
+            "status": "ok",
+            "added": len(codes),
+            "inserted": len(codes),
+        }
 
     except SQLAlchemyError as e:
         db.rollback()
