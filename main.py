@@ -1206,69 +1206,46 @@ def admin_list_codes(
 
 
 @app.post("/admin/api/codes")
-async def admin_add_codes(payload: Dict[str, Any]):
+def admin_add_codes(payload: Dict[str, Any]):
     """
-    Dodaje nowe kody do bazy.
-
-    JSON body:
-    {
-      "value": 100,
-      "codes": ["ABC-123", "DEF-456", ...]
-    }
+    Dodaje nowe kody do puli dla danego nominału.
+    payload: { "value": 100, "codes": ["ABC123", "DEF456", ...] }
     """
-    value = payload.get("value")
-    codes = payload.get("codes")
+    value = int(payload.get("value"))
+    codes_raw = payload.get("codes") or ""
+    codes = [c.strip() for c in codes_raw.splitlines() if c.strip()]
 
-    if not isinstance(value, int) or value not in (100, 200, 300, 500):
-        raise HTTPException(
-            status_code=400,
-            detail="Pole 'value' musi być jednym z: 100, 200, 300, 500.",
-        )
-    if not isinstance(codes, list) or not codes:
-        raise HTTPException(
-            status_code=400,
-            detail="Pole 'codes' musi być niepustą listą kodów (stringów).",
-        )
-
-    cleaned_codes = []
-    for c in codes:
-        if not isinstance(c, str):
-            continue
-        code = c.strip()
-        if code:
-            cleaned_codes.append(code)
-
-    if not cleaned_codes:
-        raise HTTPException(
-            status_code=400,
-            detail="Brak poprawnych kodów do dodania.",
-        )
+    if not codes:
+        raise HTTPException(status_code=400, detail="Brak kodów do dodania")
 
     db = SessionLocal()
     try:
-        for code in cleaned_codes:
+        for code in codes:
             db.execute(
                 text(
                     """
-                    INSERT INTO gift_codes (code, value, used, order_id)
-                    VALUES (:code, :value, FALSE, NULL)
+                    INSERT INTO gift_codes (code, value, order_id)
+                    VALUES (:code, :value, NULL)
                     """
                 ),
                 {"code": code, "value": value},
             )
+
         db.commit()
         logger.info(
-            "Dodano %s nowych kodów dla nominału %s.",
-            len(cleaned_codes),
+            "Dodano %s nowych kodów dla nominału %s",
+            len(codes),
             value,
         )
-        return {"status": "ok", "inserted": len(cleaned_codes)}
+        return {"status": "ok", "added": len(codes)}
+
     except SQLAlchemyError as e:
         db.rollback()
         logger.exception("Błąd podczas dodawania nowych kodów: %s", e)
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
+
 
 
 
