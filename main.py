@@ -1,5 +1,8 @@
 import logging
 import os
+import json
+import io
+import csv
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, Request, Query, HTTPException
@@ -15,8 +18,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from database.models import Base
 from database.session import engine, SessionLocal
 from database import crud
-from pdf_utils import generate_giftcard_pdf
-from email_utils import send_giftcard_email, send_email
+from pdf_utils import generate_giftcard_pdf, TEMPLATE_PATH
+from email_utils import send_giftcard_email, send_email, SENDGRID_API_KEY, SENDGRID_FROM_EMAIL
 from idosell_client import IdosellClient, IdosellApiError
 
 # ------------------------------------------------------------------------------
@@ -28,7 +31,7 @@ logger = logging.getLogger("giftcard-webhook")
 
 app = FastAPI(title="WASSYL Giftcard Webhook")
 
-# Inicjalizacja bazy
+# Inicjalizacja bazy (w tym nowej tabeli webhook_events)
 Base.metadata.create_all(bind=engine)
 
 # Globalny klient Idosell (może być None, jeśli brak konfiguracji)
@@ -44,8 +47,7 @@ if IDOSELL_DOMAIN and IDOSELL_API_KEY:
 else:
     idosell_client = None
     logger.warning(
-        "Brak konfiguracji IDOSELL_DOMAIN lub IDOSELL_API_KEY - "
-        "integracja z Idosell będzie nieaktywna."
+        "Brak konfiguracji IDOSELL_DOMAIN/IDOSELL_API_KEY – integracja z Idosell będzie nieaktywna."
     )
 
 # Stałe dla produktu karty podarunkowej
@@ -84,28 +86,31 @@ def _extract_giftcard_positions(order: Dict[str, Any]) -> List[Dict[str, Any]]:
         products = order_details.get("basket") or []
 
     for item in products:
-        product_id = item.get("productId")
+        try:
+            product_id = int(item.get("productId") or 0)
+        except (TypeError, ValueError):
+            continue
+
         if product_id != GIFT_PRODUCT_ID:
             continue
 
-        size_panel_name = item.get("sizePanelName")
-        value = GIFT_VARIANTS.get(size_panel_name)
-        if not value:
-            logger.warning(
-                "Pozycja karty podarunkowej z nieznanym wariantem '%s' (productId=%s).",
-                size_panel_name,
-                product_id,
-            )
+        variant_name = str(item.get("productName") or "")
+        matched_value: Optional[int] = None
+        for label, val in GIFT_VARIANTS.items():
+            if label in variant_name:
+                matched_value = val
+                break
+
+        if matched_value is None:
             continue
 
-        # w productsResults ilość jest w polu 'productQuantity'
-        quantity = (
+        quantity = int(
             item.get("productQuantity")
             or item.get("quantity")
             or 1
         )
 
-        result.append({"value": value, "quantity": quantity})
+        result.append({"value": matched_value, "quantity": quantity})
 
     return result
 
@@ -118,6 +123,49 @@ def _is_order_paid(order: Dict[str, Any]) -> bool:
     order_details = order.get("orderDetails") or {}
     prepaids = order_details.get("prepaids") or []
     return any(p.get("paymentStatus") == "y" for p in prepaids)
+
+
+def log_webhook_event(
+    status: str,
+    message: str,
+    payload: Any,
+    order_id: Optional[str] = None,
+    order_serial: Optional[str] = None,
+    event_type: str = "order_webhook",
+) -> None:
+    """
+    Zapisuje prosty log webhooka w tabeli webhook_events.
+    Błędy logowania nie blokują obsługi webhooka.
+    """
+    try:
+        db = SessionLocal()
+        db.execute(
+            text(
+                """
+                INSERT INTO webhook_events (
+                    event_type, status, message,
+                    order_id, order_serial, payload
+                )
+                VALUES (:event_type, :status, :message, :order_id, :order_serial, :payload)
+                """
+            ),
+            {
+                "event_type": event_type,
+                "status": status,
+                "message": (message or "")[:500],
+                "order_id": order_id,
+                "order_serial": str(order_serial) if order_serial is not None else None,
+                "payload": json.dumps(payload, ensure_ascii=False)[:8000],
+            },
+        )
+        db.commit()
+    except Exception as e:
+        logger.exception("Nie udało się zapisać logu webhooka: %s", e)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------------------
@@ -154,9 +202,12 @@ async def idosell_order_webhook(request: Request):
             order = payload
 
     if not isinstance(order, dict):
-        logger.error(
-            "Webhook /webhook/order: brak lub nieprawidłowa sekcja 'order'. Payload: %s",
-            payload,
+        msg = "Webhook /webhook/order: brak lub nieprawidłowa sekcja 'order'."
+        logger.error("%s Payload: %s", msg, payload)
+        log_webhook_event(
+            status="bad_request",
+            message=msg,
+            payload=payload,
         )
         return JSONResponse(
             {"status": "ignored", "reason": "no_order"},
@@ -182,7 +233,7 @@ async def idosell_order_webhook(request: Request):
         if isinstance(end_client, dict):
             client_email = end_client.get("clientEmail")
 
-    # wariant 3: order["clientResult"]["clientAccount"]["clientEmail"]
+        # wariant 3: order["clientResult"]["clientAccount"]["clientEmail"]
         if not client_email:
             client_account = client_result.get("clientAccount") or {}
             if isinstance(client_account, dict):
@@ -195,25 +246,45 @@ async def idosell_order_webhook(request: Request):
         client_email,
     )
 
-    # ...reszta funkcji bez zmian (sprawdzenie opłacenia, przydział kodów itd.)
-
-
     # 1. Sprawdzamy, czy zamówienie jest opłacone
     if not _is_order_paid(order):
+        msg = "Zamówienie nie jest opłacone – ignoruję webhook."
         logger.info(
-            "Zamówienie %s nie jest jeszcze opłacone – ignoruję.",
+            "Zamówienie %s (serial: %s) nie jest opłacone – ignoruję.",
             order_id,
+            order_serial,
         )
-        return {"status": "not_paid", "orderId": order_id}
+        log_webhook_event(
+            status="ignored_unpaid",
+            message=msg,
+            payload=order,
+            order_id=order_id,
+            order_serial=str(order_serial) if order_serial is not None else None,
+        )
+        return JSONResponse(
+            {"status": "ignored", "reason": "unpaid"},
+            status_code=200,
+        )
 
     # 2. Wyciągamy pozycje kart podarunkowych
     gift_positions = _extract_giftcard_positions(order)
     if not gift_positions:
+        msg = "Opłacone zamówienie nie zawiera kart podarunkowych – ignoruję."
         logger.info(
             "Opłacone zamówienie %s nie zawiera kart podarunkowych – ignoruję.",
             order_id,
         )
-        return {"status": "no_giftcards", "orderId": order_id}
+        log_webhook_event(
+            status="ignored_no_giftcards",
+            message=msg,
+            payload=order,
+            order_id=order_id,
+            order_serial=str(order_serial) if order_serial is not None else None,
+        )
+        return JSONResponse(
+            {"status": "ok", "reason": "no_giftcards"},
+            status_code=200,
+        )
 
     # 3. Przydzielamy kody z puli
     db = SessionLocal()
@@ -273,6 +344,14 @@ async def idosell_order_webhook(request: Request):
                         value,
                         order_id,
                     )
+                    db.rollback()
+                    log_webhook_event(
+                        status="error",
+                        message=f"Brak kodów dla nominału {value}",
+                        payload=order,
+                        order_id=order_id,
+                        order_serial=order_serial_str,
+                    )
                     raise HTTPException(
                         status_code=500,
                         detail=f"Brak kodów dla nominału {value}",
@@ -292,11 +371,25 @@ async def idosell_order_webhook(request: Request):
 
     except Exception as e:
         db.rollback()
-        logger.exception("Błąd podczas przydzielania kodów dla zamówienia %s (%s): %s",
-                        order_id, order_serial, e)
+        logger.exception(
+            "Błąd podczas przydzielania kodów dla zamówienia %s (%s): %s",
+            order_id,
+            order_serial,
+            e,
+        )
+        log_webhook_event(
+            status="error",
+            message=f"Błąd przydzielania kodów: {e}",
+            payload=order,
+            order_id=order_id,
+            order_serial=str(order_serial) if order_serial is not None else None,
+        )
         raise
+    finally:
+        db.close()
 
-    # 4. Wysyłka e-maila z kartą/kartami
+    # 4. Wysyłka e-maila z kartą/kartami – TYLKO przy pierwszym przydzieleniu
+    #    (jeśli assigned_codes jest puste, to prawdopodobnie retry webhooka)
     if client_email and assigned_codes:
         try:
             send_giftcard_email(
@@ -314,11 +407,11 @@ async def idosell_order_webhook(request: Request):
             logger.exception("Błąd przy wysyłaniu e-maila z kartą: %s", e)
     else:
         logger.warning(
-            "Brak e-maila klienta lub brak przypisanych kodów dla zamówienia %s – pomijam wysyłkę maila.",
+            "Brak e-maila klienta lub brak NOWO przypisanych kodów dla zamówienia %s – pomijam wysyłkę maila (prawdopodobnie retry).",
             order_id,
         )
 
-    # 5. Aktualizacja notatki zamówienia w Idosell
+    # 5. Aktualizacja notatki zamówienia w Idosell (tylko gdy są nowe kody)
     if assigned_codes and order_serial and idosell_client:
         codes_text = ", ".join(
             f"{c['code']} ({c['value']} zł)" for c in assigned_codes
@@ -339,11 +432,20 @@ async def idosell_order_webhook(request: Request):
                 order_serial,
                 e,
             )
-    elif not idosell_client:
+    elif assigned_codes and not idosell_client:
         logger.warning(
             "Brak skonfigurowanego klienta Idosell – pomijam aktualizację notatki dla zamówienia %s.",
             order_id,
         )
+
+    # Log sukcesu webhooka
+    log_webhook_event(
+        status="processed",
+        message=f"Przydzielono {len(assigned_codes)} nowych kodów.",
+        payload=order,
+        order_id=order_id,
+        order_serial=str(order_serial) if order_serial is not None else None,
+    )
 
     return {
         "status": "processed",
@@ -354,7 +456,123 @@ async def idosell_order_webhook(request: Request):
 
 
 # ------------------------------------------------------------------------------
-# PROSTY PANEL ADMINISTRACYJNY / FRONTEND
+# PROSTE ENDPOINTY POMOCNICZE / DEBUG
+# ------------------------------------------------------------------------------
+
+
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return PlainTextResponse("WASSYL Giftcard Webhook – działa.")
+
+
+@app.get("/health")
+def health_check():
+    """
+    Sprawdzenie:
+    - połączenia z DB
+    - konfiguracji SendGrid
+    - obecności szablonu PDF
+    - konfiguracji Idosell
+    """
+    db_ok = False
+    sendgrid_ok = False
+    pdf_ok = False
+    idosell_ok = False
+
+    # DB
+    try:
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as e:
+        logger.exception("Healthcheck DB failed: %s", e)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    # SendGrid – tylko sprawdzamy czy jest skonfigurowany klucz i nadawca
+    sendgrid_ok = bool(SENDGRID_API_KEY and SENDGRID_FROM_EMAIL)
+
+    # PDF template
+    pdf_ok = bool(TEMPLATE_PATH and os.path.exists(TEMPLATE_PATH))
+
+    # Idosell
+    idosell_ok = idosell_client is not None
+
+    status_code = 200 if db_ok and sendgrid_ok and pdf_ok else 503
+
+    return JSONResponse(
+        {
+            "database": db_ok,
+            "sendgrid_configured": sendgrid_ok,
+            "pdf_template_found": pdf_ok,
+            "idosell_configured": idosell_ok,
+        },
+        status_code=status_code,
+    )
+
+
+@app.get("/debug/test-pdf")
+def debug_test_pdf():
+    """
+    Generuje testowy PDF karty podarunkowej (bez wysyłki maila).
+    """
+    pdf_bytes = generate_giftcard_pdf(code="TEST-1234-ABCD", value=200)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'inline; filename="test-giftcard.pdf"'},
+    )
+
+
+@app.get("/debug/test-email")
+def debug_test_email(to: str = Query(..., description="Adres e-mail odbiorcy testu")):
+    """
+    Wysyła testowy e-mail z docelowym HTML-em i przykładową kartą podarunkową w załączniku.
+    """
+    pdf_bytes = generate_giftcard_pdf(code="TEST-DEBUG-0001", value=100)
+
+    send_email(
+        to_email=to,
+        subject="Test – WASSYL karta podarunkowa",
+        body_text=(
+            "To jest testowa wiadomość z załączoną kartą podarunkową (PDF).\n"
+            "Treść HTML odpowiada docelowemu mailowi produkcyjnemu."
+        ),
+        body_html=None,  # send_email samo zbuduje HTML jeśli None, ale tu nie nadpisujemy szablonu produkcyjnego
+        attachments=[("test-giftcard.pdf", pdf_bytes)],
+    )
+
+    return PlainTextResponse(f"Wysłano testowy e-mail na adres: {to}")
+
+
+@app.get("/debug/tables")
+def debug_tables():
+    """
+    Zwraca listę tabel w schemacie public.
+    """
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT tablename
+                FROM pg_catalog.pg_tables
+                WHERE schemaname = 'public'
+                ORDER BY tablename
+                """
+            )
+        ).fetchall()
+        tables = [r[0] for r in rows]
+        return {"tables": tables}
+    finally:
+        db.close()
+
+
+# ------------------------------------------------------------------------------
+# PROSTY PANEL ADMINA (HTML + JS)
 # ------------------------------------------------------------------------------
 
 
@@ -373,27 +591,90 @@ ADMIN_HTML = """
     body {
       margin: 0;
       padding: 0;
-      background: #f9fafb;
+      background: #0f172a;
       color: #111827;
     }
-    .page {
-      max-width: 960px;
+    * {
+      box-sizing: border-box;
+    }
+    .app {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      padding: 24px 12px;
+    }
+    @media (min-width: 768px) {
+      .app {
+        padding: 32px;
+      }
+    }
+    header {
+      max-width: 1100px;
+      margin: 0 auto 16px auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .logo img {
+      height: 32px;
+      width: auto;
+    }
+    .logo-title {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: #e5e7eb;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      color: #f9fafb;
+      background: rgba(34, 197, 94, 0.2);
+      border: 1px solid rgba(34, 197, 94, 0.5);
+    }
+    .badge-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #22c55e;
+      box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.25);
+    }
+    main.layout {
+      max-width: 1100px;
       margin: 0 auto;
-      padding: 32px 16px 64px;
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+      gap: 16px;
+      align-items: flex-start;
+    }
+    @media (max-width: 960px) {
+      main.layout {
+        grid-template-columns: minmax(0, 1fr);
+      }
     }
     .card {
       background: #ffffff;
-      border-radius: 20px;
-      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.07);
-      border: 1px solid #e5e7eb;
-      padding: 24px 24px 28px;
-      margin-bottom: 24px;
+      border-radius: 16px;
+      padding: 18px 18px 16px 18px;
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.50);
+      border: 1px solid rgba(148, 163, 184, 0.35);
     }
     .card-header {
       display: flex;
       justify-content: space-between;
-      align-items: center;
-      gap: 16px;
+      align-items: flex-start;
+      gap: 8px;
       margin-bottom: 12px;
     }
     .card-title {
@@ -408,71 +689,124 @@ ADMIN_HTML = """
       font-size: 11px;
       font-weight: 500;
       border-radius: 999px;
-      padding: 3px 9px;
-      border: 1px solid #e5e7eb;
-      color: #6b7280;
-      background: #f9fafb;
-      text-transform: uppercase;
-      letter-spacing: 0.09em;
+      padding: 3px 10px;
+      background: #eef2ff;
+      color: #3730a3;
+      border: 1px solid rgba(129, 140, 248, 0.6);
     }
     .card-description {
       font-size: 13px;
       color: #6b7280;
+      margin: 4px 0 0 0;
     }
     .section-label {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
       text-transform: uppercase;
-      font-size: 11px;
-      letter-spacing: 0.12em;
-      color: #9ca3af;
-      margin-bottom: 8px;
-      font-weight: 500;
-    }
-    .muted {
-      font-size: 13px;
       color: #6b7280;
-    }
-    .input, select, textarea {
-      width: 100%;
-      border-radius: 10px;
-      border: 1px solid #d1d5db;
-      padding: 8px 10px;
-      font-size: 13px;
-      outline: none;
-      background: #f9fafb;
-      transition: border-color 120ms, box-shadow 120ms, background 120ms;
-    }
-    .input:focus, select:focus, textarea:focus {
-      border-color: #6366f1;
-      box-shadow: 0 0 0 1px rgba(79, 70, 229, 0.25);
-      background: #ffffff;
+      margin-bottom: 6px;
     }
     textarea {
-      resize: vertical;
-      min-height: 80px;
-    }
-    .btn {
-      border-radius: 999px;
-      padding: 8px 14px;
+      width: 100%;
+      min-height: 120px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid #e5e7eb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono";
       font-size: 13px;
-      border: none;
-      cursor: pointer;
+      resize: vertical;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #4f46e5;
+      box-shadow: 0 0 0 1px rgba(79, 70, 229, 0.45);
+    }
+    .muted {
+      font-size: 12px;
+      color: #6b7280;
+    }
+    select, input[type="number"] {
+      padding: 7px 9px;
+      border-radius: 10px;
+      border: 1px solid #e5e7eb;
+      font-size: 13px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 13px;
+    }
+    thead {
+      background: #f9fafb;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+      white-space: nowrap;
+    }
+    tbody tr:hover {
+      background: #f9fafb;
+    }
+    .status-chip {
       display: inline-flex;
       align-items: center;
       gap: 6px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
       font-weight: 500;
-      background: #111827;
+    }
+    .status-used {
+      background: rgba(220, 38, 38, 0.06);
+      color: #991b1b;
+    }
+    .status-unused {
+      background: rgba(5, 150, 105, 0.06);
+      color: #166534;
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+    }
+    .status-used .status-dot {
+      background: #dc2626;
+    }
+    .status-unused .status-dot {
+      background: #22c55e;
+    }
+    .btn-row {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: none;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      background: linear-gradient(135deg, #0f172a, #020617);
       color: #f9fafb;
-      box-shadow: 0 14px 30px rgba(15, 23, 42, 0.3);
-      transition: transform 120ms, box-shadow 120ms, background 120ms, opacity 120ms;
+      box-shadow: 0 16px 35px rgba(15, 23, 42, 0.6);
+      transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
     }
     .btn:hover {
       transform: translateY(-1px);
-      box-shadow: 0 18px 40px rgba(15, 23, 42, 0.35);
+      box-shadow: 0 18px 40px rgba(15, 23, 42, 0.7);
       background: #020617;
     }
     .btn:active {
       transform: translateY(0);
-      box-shadow: 0 8px 16px rgba(15, 23, 42, 0.22);
+      box-shadow: 0 10px 18px rgba(15, 23, 42, 0.5);
     }
     .btn-secondary {
       background: #ffffff;
@@ -485,168 +819,44 @@ ADMIN_HTML = """
       box-shadow: none;
       transform: none;
     }
-    .btn-ghost {
-      background: transparent;
-      color: #4b5563;
-      border-radius: 999px;
-      padding: 6px 10px;
-      font-size: 12px;
-      border: 1px solid transparent;
-      box-shadow: none;
-    }
-    .btn-ghost:hover {
-      background: #f3f4f6;
-      border-color: #e5e7eb;
-    }
-    .badge {
-      border-radius: 999px;
-      font-size: 11px;
-      padding: 2px 8px;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      border: 1px solid #e5e7eb;
-      background: #f9fafb;
-      color: #6b7280;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-    .badge-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 999px;
-      background: #22c55e;
-    }
-    .table-wrapper {
-      border-radius: 14px;
-      border: 1px solid #e5e7eb;
-      overflow: hidden;
-      background: #ffffff;
-    }
-    table {
-      border-collapse: collapse;
-      width: 100%;
-      font-size: 13px;
-    }
-    thead {
-      background: #f9fafb;
-    }
-    th, td {
-      padding: 9px 12px;
-      border-bottom: 1px solid #e5e7eb;
-      text-align: left;
-      white-space: nowrap;
-    }
-    th {
-      font-weight: 500;
-      color: #4b5563;
-      font-size: 12px;
-    }
-    tr:last-child td {
-      border-bottom: none;
-    }
-    .status-chip {
-      border-radius: 999px;
-      padding: 2px 8px;
-      font-size: 11px;
-      font-weight: 500;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .status-unused {
-      background: #ecfdf5;
-      color: #166534;
-    }
-    .status-used {
-      background: #fef2f2;
-      color: #b91c1c;
-    }
-    .status-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: currentColor;
-    }
     .chips {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
-      margin-top: 4px;
+      margin-top: 8px;
     }
     .chip {
+      font-size: 12px;
+      padding: 4px 8px;
       border-radius: 999px;
       border: 1px solid #e5e7eb;
-      padding: 2px 10px;
-      font-size: 12px;
-      cursor: default;
       background: #f9fafb;
+      color: #374151;
     }
-    .chip strong {
-      font-weight: 600;
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
-      gap: 20px;
-    }
-    @media (max-width: 900px) {
-      .layout {
-        grid-template-columns: minmax(0, 1fr);
-      }
-    }
-    .filters {
+    .filter-row {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
       align-items: center;
+      margin: 8px 0 10px 0;
     }
-    .filters select {
-      width: auto;
-      min-width: 96px;
+    .filter-row label {
+      font-size: 12px;
+      color: #6b7280;
     }
-    .filters .btn-ghost {
-      margin-left: auto;
-    }
-    .pill {
-      border-radius: 999px;
-      border: 1px solid #e5e7eb;
-      padding: 4px 8px;
-      font-size: 11px;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      background: #f9fafb;
-      color: #4b5563;
-    }
-    .pill-label {
-      text-transform: uppercase;
-      letter-spacing: 0.09em;
-      font-size: 10px;
-      color: #9ca3af;
-    }
-    .logo {
-      font-weight: 700;
-      letter-spacing: 0.2em;
-      text-transform: uppercase;
-      font-size: 13px;
-    }
-    .logo-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: linear-gradient(135deg, #6366f1, #ec4899);
-      display: inline-block;
-      margin-right: 4px;
+    .logs-table td:nth-child(3),
+    .logs-table td:nth-child(4) {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono";
+      font-size: 12px;
     }
   </style>
 </head>
 <body>
-  <div class="page">
-    <header style="display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; gap:12px;">
-      <div>
-        <div class="logo"><span class="logo-dot"></span>WASSYL</div>
-        <div class="muted" style="font-size:12px; margin-top:4px;">
+  <div class="app">
+    <header>
+      <div class="logo">
+        <img src="https://wassyl.pl/data/include/cms/gfx/logo-wassyl.png" alt="WASSYL" />
+        <div class="logo-title">
           Panel administracyjny kart podarunkowych
         </div>
       </div>
@@ -657,6 +867,7 @@ ADMIN_HTML = """
     </header>
 
     <main class="layout">
+      <!-- Lewa kolumna: dodawanie kodów -->
       <section class="card">
         <div class="card-header">
           <div>
@@ -670,41 +881,33 @@ ADMIN_HTML = """
           </div>
         </div>
 
-        <div style="margin-top:16px;">
+        <div>
           <div class="section-label">Lista kodów</div>
           <textarea id="codes-input" placeholder="Wpisz lub wklej kody, każdy w osobnej linii..."></textarea>
-          <p class="muted" style="margin-top:4px;">
-            Przykład:
-            <code style="font-size:12px; background:#f3f4f6; padding:2px 4px; border-radius:6px;">
-              ABC-123-XYZ
-            </code>
+          <p class="muted" id="codes-summary" style="margin-top:4px;">
+            Liczba kodów: <strong>0</strong>
           </p>
         </div>
 
-        <div style="margin-top:16px;">
+        <div style="margin-top:12px;">
           <div class="section-label">Nominał</div>
-          <select id="value-select">
+          <select id="nominal-select">
             <option value="100">100 zł</option>
             <option value="200">200 zł</option>
             <option value="300">300 zł</option>
             <option value="500">500 zł</option>
           </select>
-          <p class="muted" style="margin-top:4px;">
-            Te kody zostaną dodane jako <strong>nieużyte</strong>.
-          </p>
         </div>
 
-        <div style="margin-top:18px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
-          <div class="muted" id="codes-summary">
-            Liczba kodów: <strong>0</strong>
-          </div>
-          <button class="btn" id="btn-add-codes">
+        <div class="btn-row">
+          <button class="btn" id="btn-save-codes">
             <span>➕</span>
             <span>Zapisz kody</span>
           </button>
         </div>
       </section>
 
+      <!-- Prawa kolumna: statystyki, lista kodów, eksport -->
       <section class="card">
         <div class="card-header">
           <div>
@@ -716,49 +919,51 @@ ADMIN_HTML = """
               Podgląd liczby kodów w bazie – użyte, nieużyte i łączna liczba dla każdego nominału.
             </p>
           </div>
-          <button class="btn-secondary btn" id="btn-refresh-table">
-            Odśwież
-          </button>
         </div>
 
-        <div class="chips" id="chips-summary">
-          <!-- wypełniane z JS -->
-        </div>
-
-        <div style="margin-top:18px;">
-          <div class="section-label">Filtry</div>
-          <div class="filters">
-            <select id="filter-value">
-              <option value="">Wszystkie nominały</option>
-              <option value="100">100 zł</option>
-              <option value="200">200 zł</option>
-              <option value="300">300 zł</option>
-              <option value="500">500 zł</option>
-            </select>
-            <select id="filter-used">
-              <option value="">Wszystkie statusy</option>
-              <option value="unused">Nieużyte</option>
-              <option value="used">Użyte</option>
-            </select>
-            <button class="btn-ghost" id="btn-clear-filters">
-              Wyczyść filtry
-            </button>
+        <div>
+          <div class="section-label">Statystyki</div>
+          <div id="stats-container" class="chips">
+            <span class="muted">Ładowanie statystyk...</span>
           </div>
         </div>
 
         <div style="margin-top:16px;">
           <div class="section-label">Ostatnie kody</div>
-          <div class="table-wrapper">
+          <div class="filter-row">
+            <label>
+              Nominał:
+              <select id="filter-value">
+                <option value="">Wszystkie</option>
+                <option value="100">100 zł</option>
+                <option value="200">200 zł</option>
+                <option value="300">300 zł</option>
+                <option value="500">500 zł</option>
+              </select>
+            </label>
+            <label>
+              Status:
+              <select id="filter-used">
+                <option value="">Wszystkie</option>
+                <option value="unused">Tylko nieużyte</option>
+                <option value="used">Tylko użyte</option>
+              </select>
+            </label>
+            <button class="btn-secondary" id="btn-refresh-codes">Odśwież</button>
+            <button class="btn-secondary" id="btn-export-csv">Eksport CSV</button>
+          </div>
+
+          <div style="max-height: 260px; overflow:auto; border-radius: 10px; border: 1px solid #e5e7eb;">
             <table>
               <thead>
                 <tr>
                   <th>Kod</th>
                   <th>Nominał</th>
                   <th>Status</th>
-                  <th>Numer zamówienia</th>
+                  <th>Order ID</th>
                 </tr>
               </thead>
-              <tbody id="codes-table-body">
+              <tbody id="codes-tbody">
                 <tr>
                   <td colspan="4" class="muted" style="text-align:center; padding:20px;">
                     Ładowanie danych...
@@ -768,8 +973,45 @@ ADMIN_HTML = """
             </table>
           </div>
           <p class="muted" style="margin-top:8px; font-size:12px;">
-            Wyświetlane są najnowsze kody, maksymalnie 100 rekordów.
+            Wyświetlane są najnowsze kody, domyślnie maksymalnie 100 rekordów.
           </p>
+        </div>
+      </section>
+
+      <!-- Druga karta: logi webhooka -->
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">
+              Logi webhooka
+              <span class="card-title-badge">debug</span>
+            </div>
+            <p class="card-description">
+              Ostatnie 50 wywołań /webhook/order – status, numer zamówienia, krótka wiadomość.
+            </p>
+          </div>
+          <button class="btn-secondary" id="btn-refresh-logs">Odśwież</button>
+        </div>
+
+        <div style="max-height: 260px; overflow:auto; border-radius: 10px; border: 1px solid #e5e7eb;">
+          <table class="logs-table">
+            <thead>
+              <tr>
+                <th>Data</th>
+                <th>Status</th>
+                <th>orderId</th>
+                <th>Serial</th>
+                <th>Komunikat</th>
+              </tr>
+            </thead>
+            <tbody id="logs-tbody">
+              <tr>
+                <td colspan="5" class="muted" style="text-align:center; padding:20px;">
+                  Ładowanie logów...
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </section>
     </main>
@@ -793,10 +1035,12 @@ ADMIN_HTML = """
     }
 
     textarea.addEventListener("input", updateSummary);
-    updateSummary();
 
-    async function addCodes() {
+    async function saveCodes() {
+      const nominalSelect = document.getElementById("nominal-select");
+      const value = parseInt(nominalSelect.value, 10);
       const text = textarea.value.trim();
+
       if (!text) {
         alert("Wpisz przynajmniej jeden kod.");
         return;
@@ -807,46 +1051,40 @@ ADMIN_HTML = """
         .map((l) => l.trim())
         .filter((l) => l.length > 0);
 
-      const valueSelect = document.getElementById("value-select");
-      const value = parseInt(valueSelect.value, 10);
-
-      const payload = {
-        value: value,
-        codes: lines,
-      };
+      if (lines.length === 0) {
+        alert("Brak poprawnych linii z kodami.");
+        return;
+      }
 
       try {
         const res = await fetch("/admin/api/codes", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload),
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            value: value,
+            codes: lines
+          }),
         });
-
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
-          alert("Błąd przy zapisie kodów: " + (err.detail || res.statusText));
+          alert("Błąd podczas zapisywania kodów: " + (err.detail || res.status));
           return;
         }
-
         const data = await res.json();
         alert("Zapisano " + data.inserted + " kodów.");
         textarea.value = "";
         updateSummary();
-        fetchStats();
-        fetchCodes();
+        loadStats();
+        loadCodes();
       } catch (e) {
         console.error(e);
-        alert("Wystąpił błąd sieci przy zapisie kodów.");
+        alert("Wystąpił błąd przy komunikacji z serwerem.");
       }
     }
 
-    document.getElementById("btn-add-codes").addEventListener("click", addCodes);
-
-    async function fetchStats() {
-      const statsEl = document.getElementById("chips-summary");
-      statsEl.innerHTML = "";
+    async function loadStats() {
+      const statsEl = document.getElementById("stats-container");
+      statsEl.innerHTML = '<span class="muted">Ładowanie statystyk...</span>';
 
       try {
         const res = await fetch("/admin/api/stats");
@@ -869,6 +1107,7 @@ ADMIN_HTML = """
           500: "500 zł",
         };
 
+        statsEl.innerHTML = "";
         data.forEach((row) => {
           const div = document.createElement("div");
           div.className = "chip";
@@ -887,12 +1126,12 @@ ADMIN_HTML = """
       } catch (e) {
         console.error(e);
         statsEl.innerHTML =
-          '<span class="muted">Błąd sieci przy pobieraniu statystyk.</span>';
+          '<span class="muted">Błąd przy pobieraniu statystyk.</span>';
       }
     }
 
-    async function fetchCodes() {
-      const tbody = document.getElementById("codes-table-body");
+    async function loadCodes() {
+      const tbody = document.getElementById("codes-tbody");
       tbody.innerHTML =
         '<tr><td colspan="4" class="muted" style="text-align:center; padding:20px;">Ładowanie danych...</td></tr>';
 
@@ -950,190 +1189,134 @@ ADMIN_HTML = """
       } catch (e) {
         console.error(e);
         tbody.innerHTML =
-          '<tr><td colspan="4" class="muted" style="text-align:center; padding:20px;">Błąd sieci przy pobieraniu kodów.</td></tr>';
+          '<tr><td colspan="4" class="muted" style="text-align:center; padding:20px;">Błąd przy pobieraniu kodów.</td></tr>';
       }
     }
 
-    document.getElementById("btn-refresh-table").addEventListener("click", function () {
-      fetchStats();
-      fetchCodes();
-    });
+    async function loadLogs() {
+      const tbody = document.getElementById("logs-tbody");
+      tbody.innerHTML =
+        '<tr><td colspan="5" class="muted" style="text-align:center; padding:20px;">Ładowanie logów...</td></tr>';
 
-    document.getElementById("btn-clear-filters").addEventListener("click", function () {
-      document.getElementById("filter-value").value = "";
-      document.getElementById("filter-used").value = "";
-      fetchCodes();
-    });
+      try {
+        const res = await fetch("/admin/api/logs");
+        if (!res.ok) {
+          tbody.innerHTML =
+            '<tr><td colspan="5" class="muted" style="text-align:center; padding:20px;">Błąd przy pobieraniu logów.</td></tr>';
+          return;
+        }
+        const data = await res.json();
+        if (!data || data.length === 0) {
+          tbody.innerHTML =
+            '<tr><td colspan="5" class="muted" style="text-align:center; padding:20px;">Brak logów do wyświetlenia.</td></tr>';
+          return;
+        }
 
-    // pierwsze ładowanie
-    fetchStats();
-    fetchCodes();
+        tbody.innerHTML = "";
+        data.forEach((row) => {
+          const tr = document.createElement("tr");
+
+          const tdDate = document.createElement("td");
+          tdDate.textContent = row.created_at || "—";
+          tr.appendChild(tdDate);
+
+          const tdStatus = document.createElement("td");
+          tdStatus.textContent = row.status;
+          tr.appendChild(tdStatus);
+
+          const tdOrderId = document.createElement("td");
+          tdOrderId.textContent = row.order_id || "—";
+          tr.appendChild(tdOrderId);
+
+          const tdSerial = document.createElement("td");
+          tdSerial.textContent = row.order_serial || "—";
+          tr.appendChild(tdSerial);
+
+          const tdMsg = document.createElement("td");
+          tdMsg.textContent = row.message || "";
+          tr.appendChild(tdMsg);
+
+          tbody.appendChild(tr);
+        });
+      } catch (e) {
+        console.error(e);
+        tbody.innerHTML =
+          '<tr><td colspan="5" class="muted" style="text-align:center; padding:20px;">Błąd przy pobieraniu logów.</td></tr>';
+      }
+    }
+
+    function exportCsv() {
+      const filterValue = document.getElementById("filter-value").value;
+      const filterUsed = document.getElementById("filter-used").value;
+
+      const params = new URLSearchParams();
+      if (filterValue) params.set("value", filterValue);
+      if (filterUsed) params.set("used", filterUsed);
+
+      const url = "/admin/api/codes/export" + (params.toString() ? "?" + params.toString() : "");
+      window.open(url, "_blank");
+    }
+
+    document.getElementById("btn-save-codes").addEventListener("click", saveCodes);
+    document.getElementById("btn-refresh-codes").addEventListener("click", loadCodes);
+    document.getElementById("btn-export-csv").addEventListener("click", exportCsv);
+    document.getElementById("btn-refresh-logs").addEventListener("click", loadLogs);
+
+    // initial load
+    loadStats();
+    loadCodes();
+    loadLogs();
   </script>
 </body>
 </html>
 """
 
 
-# ------------------------------------------------------------------------------
-# ROUTES: ROOT, HEALTH, DEBUG, ADMIN
-# ------------------------------------------------------------------------------
-
-
-@app.get("/", response_class=PlainTextResponse)
-def root() -> str:
-    return "WASSYL Giftcard Webhook – OK"
-
-
-@app.get("/health")
-def health_check():
-    """
-    Prosty endpoint sprawdzający kondycję aplikacji:
-    - połączenie z bazą
-    - dostępność klucza SendGrid
-    - obecność pliku szablonu PDF
-    - konfigurację IdosellClient
-    """
-    # 1. Baza danych
-    db_status = "unknown"
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        db_status = "ok"
-    except Exception as e:
-        db_status = f"error: {e}"
-
-    # 2. SendGrid
-    from email_utils import SENDGRID_API_KEY as SG_KEY  # import lokalny, żeby nie robić cykli
-    sendgrid_status = "configured" if SG_KEY else "missing"
-
-    # 3. PDF template
-    from pdf_utils import TEMPLATE_PATH  # ścieżka do WASSYL-GIFTCARD.pdf
-    pdf_template_status = "found" if os.path.exists(TEMPLATE_PATH) else "missing"
-
-    # 4. Idosell
-    idosell_status = "configured" if idosell_client is not None else "missing"
-
-    return {
-        "status": "ok" if db_status == "ok" else "degraded",
-        "services": {
-            "database": db_status,
-            "sendgrid": sendgrid_status,
-            "pdf_template": pdf_template_status,
-            "idosell": idosell_status,
-        },
-    }
-
-
-@app.get("/debug/test-pdf")
-def debug_test_pdf():
-    """
-    Generuje testowy PDF karty podarunkowej (bez wysyłki maila).
-    """
-    # przykładowe dane
-    pdf_bytes = generate_giftcard_pdf(code="TEST-1234-ABCD", value=200)
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'inline; filename="test-giftcard.pdf"'},
-    )
-
-
-@app.get("/debug/test-email")
-def debug_test_email(to: str = Query(..., description="Adres e-mail odbiorcy testu")):
-    """
-    Wysyła testowy e-mail z przykładową kartą podarunkową w załączniku.
-    """
-    # generujemy prosty testowy PDF
-    pdf_bytes = generate_giftcard_pdf(code="TEST-DEBUG-0001", value=100)
-
-    send_email(
-        to_email=to,
-        subject="Test – WASSYL karta podarunkowa",
-        body_text="To jest testowa wiadomość z załączoną kartą podarunkową (PDF).",
-        body_html="<p>To jest <strong>testowa</strong> wiadomość z załączoną kartą podarunkową (PDF).</p>",
-        attachments=[("test-giftcard.pdf", pdf_bytes)],
-    )
-    return {"status": "sent", "to": to}
-
-
-@app.get("/debug/tables")
-def debug_tables():
-    """
-    Zwraca listę tabel w schemacie public (do diagnostyki).
-    """
-    with engine.connect() as conn:
-        result = conn.execute(
-            text(
-                """
-                SELECT tablename
-                FROM pg_catalog.pg_tables
-                WHERE schemaname = 'public'
-                ORDER BY tablename
-                """
-            )
-        )
-        tables = [row[0] for row in result]
-
-    return {"tables": tables}
-
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     """
-    Prosty panel administracyjny (HTML + JS) do zarządzania kodami.
+    Prosty panel administracyjny (HTML + JS) do zarządzania kodami i podglądu logów webhooka.
     """
     return HTMLResponse(content=ADMIN_HTML)
 
 
 # ------------------------------------------------------------------------------
-# ADMIN API – operacje na kodach
+# ADMIN API – operacje na kodach i logach
 # ------------------------------------------------------------------------------
 
 
 @app.get("/admin/api/stats")
 def admin_stats():
     """
-    Zwraca statystyki kodów według nominału:
-
-    [
-      {
-        "value": 100,
-        "total": 10,
-        "used": 3,
-        "unused": 7
-      },
-      ...
-    ]
-
-    Użycie kodu liczymy po tym, czy order_id jest ustawione (NOT NULL).
+    Zwraca statystyki kodów (po nominale).
     """
     db = SessionLocal()
     try:
-        result = db.execute(
+        rows = db.execute(
             text(
                 """
                 SELECT
                   value,
                   COUNT(*) AS total,
-                  COUNT(order_id) AS used,
-                  COUNT(*) - COUNT(order_id) AS unused
+                  COUNT(*) FILTER (WHERE order_id IS NULL) AS unused,
+                  COUNT(*) FILTER (WHERE order_id IS NOT NULL) AS used
                 FROM gift_codes
                 GROUP BY value
                 ORDER BY value
                 """
             )
-        )
-        rows = result.fetchall()
-        stats = [
+        ).fetchall()
+
+        data = [
             {
                 "value": row.value,
                 "total": row.total,
-                "used": row.used,
                 "unused": row.unused,
+                "used": row.used,
             }
             for row in rows
         ]
-        return stats
+        return data
     except SQLAlchemyError as e:
         logger.exception("Błąd podczas pobierania statystyk: %s", e)
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
@@ -1151,13 +1334,11 @@ def admin_list_codes(
 ):
     """
     Zwraca listę ostatnich kodów z możliwością filtrowania.
-
-    Pole 'used' wyliczamy na podstawie tego, czy order_id jest ustawione.
     """
     db = SessionLocal()
     try:
         conditions = []
-        params: Dict[str, Any] = {}
+        params: Dict[str, Any] = {"limit": limit}
 
         if value is not None:
             conditions.append("value = :value")
@@ -1182,16 +1363,13 @@ def admin_list_codes(
             LIMIT :limit
             """
         )
-        params["limit"] = limit
+        rows = db.execute(query, params).fetchall()
 
-        result = db.execute(query, params)
-        rows = result.fetchall()
         codes = [
             {
                 "id": row.id,
                 "code": row.code,
                 "value": row.value,
-                # 'used' liczymy po order_id
                 "used": row.order_id is not None,
                 "order_id": row.order_id,
             }
@@ -1259,6 +1437,116 @@ def admin_add_codes(payload: Dict[str, Any]):
     except SQLAlchemyError as e:
         db.rollback()
         logger.exception("Błąd podczas dodawania nowych kodów: %s", e)
+        raise HTTPException(status_code=500, detail="Błąd bazy danych")
+    finally:
+        db.close()
+
+
+@app.get("/admin/api/codes/export")
+def admin_export_codes(
+    value: Optional[int] = Query(None, description="Filtr po nominale (np. 100, 200)"),
+    used: Optional[str] = Query(
+        None, description="Filtr statusu: 'used' lub 'unused'"
+    ),
+):
+    """
+    Eksport kodów do pliku CSV (id;code;value;order_id).
+    Respektuje te same filtry, co /admin/api/codes.
+    """
+    db = SessionLocal()
+    try:
+        conditions = []
+        params: Dict[str, Any] = {}
+
+        if value is not None:
+            conditions.append("value = :value")
+            params["value"] = value
+
+        if used is not None:
+            if used == "used":
+                conditions.append("order_id IS NOT NULL")
+            elif used == "unused":
+                conditions.append("order_id IS NULL")
+
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+
+        query = text(
+            f"""
+            SELECT id, code, value, order_id
+            FROM gift_codes
+            {where_clause}
+            ORDER BY id ASC
+            """
+        )
+        rows = db.execute(query, params).fetchall()
+
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=";")
+        writer.writerow(["id", "code", "value", "order_id"])
+        for row in rows:
+            writer.writerow([row.id, row.code, row.value, row.order_id])
+
+        csv_data = output.getvalue()
+        return Response(
+            content=csv_data,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": 'attachment; filename="gift_codes_export.csv"'
+            },
+        )
+    except SQLAlchemyError as e:
+        logger.exception("Błąd podczas eksportu kodów: %s", e)
+        raise HTTPException(status_code=500, detail="Błąd bazy danych")
+    finally:
+        db.close()
+
+
+@app.get("/admin/api/logs")
+def admin_list_logs(
+    limit: int = Query(50, ge=1, le=200, description="Maksymalna liczba logów"),
+):
+    """
+    Zwraca ostatnie logi webhooka z tabeli webhook_events.
+    """
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, event_type, status, message,
+                       order_id, order_serial, created_at
+                FROM webhook_events
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        ).fetchall()
+
+        logs = []
+        for row in rows:
+            created_at = None
+            if getattr(row, "created_at", None) is not None:
+                try:
+                    created_at = row.created_at.isoformat(sep=" ", timespec="seconds")
+                except Exception:
+                    created_at = str(row.created_at)
+            logs.append(
+                {
+                    "id": row.id,
+                    "event_type": row.event_type,
+                    "status": row.status,
+                    "message": row.message,
+                    "order_id": row.order_id,
+                    "order_serial": row.order_serial,
+                    "created_at": created_at,
+                }
+            )
+        return logs
+    except SQLAlchemyError as e:
+        logger.exception("Błąd podczas pobierania logów webhooka: %s", e)
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
