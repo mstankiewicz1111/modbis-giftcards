@@ -56,7 +56,7 @@ GIFT_VARIANTS = {
     "100 zł": 100,
     "200 zł": 200,
     "300 zł": 300,
-    "400 zł": 400
+    "400 zł": 400,
     "500 zł": 500,
 }
 
@@ -463,7 +463,7 @@ async def idosell_order_webhook(request: Request):
 
 @app.get("/", response_class=PlainTextResponse)
 def root():
-    return PlainTextResponse("WASSYL Giftcard Webhook – działa.")
+    return PlainTextResponse("MODBIS Giftcard Webhook – działa.")
 
 
 @app.get("/health")
@@ -1553,5 +1553,6 @@ def admin_list_logs(
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
+
 
 
