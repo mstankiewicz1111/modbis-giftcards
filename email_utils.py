@@ -11,27 +11,29 @@ from pdf_utils import generate_giftcard_pdf
 logger = logging.getLogger("giftcard-webhook")
 
 # ------------------------------------------------------------------------------
-# Konfiguracja SendGrid
+# Konfiguracja MailerSend
 # ------------------------------------------------------------------------------
 
-SENDGRID_API_KEY: Optional[str] = os.getenv("SENDGRID_API_KEY")
+MAILERSEND_API_KEY: Optional[str] = os.getenv("MAILERSEND_API_KEY")
 
-# Wsparcie zarówno dla EMAIL_FROM, jak i SENDGRID_FROM_EMAIL
-SENDGRID_FROM_EMAIL: str = (
-    os.getenv("EMAIL_FROM")
-    or os.getenv("SENDGRID_FROM_EMAIL")
-    or "vouchery@wassyl.pl"
+# Wsparcie dla EMAIL_FROM (jak wcześniej przy SendGrid)
+FROM_EMAIL: str = os.getenv("EMAIL_FROM") or "vouchery@example.com"
+FROM_NAME: str = (
+    os.getenv("MAILERSEND_FROM_NAME")
+    or os.getenv("SENDGRID_FROM_NAME")  # backwards compatibility z istniejącym ENV
+    or "Giftcards"
 )
-SENDGRID_FROM_NAME: str = os.getenv("SENDGRID_FROM_NAME", "Wassyl")
 
-SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
+MAILERSEND_API_URL = "https://api.mailersend.com/v1/email"
 
-# Log pomocniczy, żeby w logach startowych było widać, jaki FROM faktycznie używamy
-logger.info("SendGrid FROM email skonfigurowany jako: %r", SENDGRID_FROM_EMAIL)
+# Backwards-compat: /health w main.py importuje SENDGRID_API_KEY
+SENDGRID_API_KEY: Optional[str] = MAILERSEND_API_KEY
+
+logger.info("MailerSend FROM email skonfigurowany jako: %r", FROM_EMAIL)
 
 
 # ------------------------------------------------------------------------------
-# Niskopoziomowa funkcja do wysyłania maili przez SendGrid Web API v3
+# Niskopoziomowa funkcja do wysyłania maili przez MailerSend Web API
 # ------------------------------------------------------------------------------
 
 
@@ -43,7 +45,7 @@ def send_email(
     attachments: Optional[List[Tuple[str, bytes]]] = None,
 ) -> None:
     """
-    Wysyła wiadomość e-mail przy użyciu SendGrid Web API v3.
+    Wysyła wiadomość e-mail przy użyciu MailerSend Web API.
 
     :param to_email: adres odbiorcy
     :param subject: temat wiadomości
@@ -51,62 +53,55 @@ def send_email(
     :param body_html: treść w formacie text/html (opcjonalnie)
     :param attachments: lista załączników (nazwa_pliku, zawartość_bytes)
     """
-    if not SENDGRID_API_KEY:
-        logger.error("Brak SENDGRID_API_KEY – nie można wysłać e-maila.")
-        raise RuntimeError("SENDGRID_API_KEY is not configured")
+    if not MAILERSEND_API_KEY:
+        logger.error("Brak MAILERSEND_API_KEY – nie można wysłać e-maila.")
+        raise RuntimeError("MAILERSEND_API_KEY is not configured")
 
     if body_html is None:
         body_html = f"<pre>{body_text}</pre>"
 
     data: Dict[str, Any] = {
-        "personalizations": [
+        "from": {
+            "email": FROM_EMAIL,
+            "name": FROM_NAME,
+        },
+        "to": [
             {
-                "to": [{"email": to_email}],
-                "subject": subject,
+                "email": to_email,
             }
         ],
-        "from": {
-            "email": SENDGRID_FROM_EMAIL,
-            "name": SENDGRID_FROM_NAME,
-        },
-        "content": [
-            {
-                "type": "text/plain",
-                "value": body_text,
-            },
-            {
-                "type": "text/html",
-                "value": body_html,
-            },
-        ],
+        "subject": subject,
+        "text": body_text,
+        "html": body_html,
     }
 
+    # Załączniki – zgodnie z dokumentacją MailerSend:
+    # attachments: [{ "filename": "...", "content": "BASE64_ENCODED" }, ...]
     if attachments:
-        sg_attachments: List[Dict[str, Any]] = []
+        ms_attachments: List[Dict[str, Any]] = []
         for filename, file_bytes in attachments:
             encoded = base64.b64encode(file_bytes).decode("ascii")
-            sg_attachments.append(
+            ms_attachments.append(
                 {
-                    "content": encoded,
-                    "type": "application/pdf",
                     "filename": filename,
-                    "disposition": "attachment",
+                    "content": encoded,
+                    # "disposition": "attachment"  # opcjonalne, domyślnie i tak jest attachment
                 }
             )
-        data["attachments"] = sg_attachments
+        data["attachments"] = ms_attachments
 
     headers = {
-        "Authorization": f"Bearer {SENDGRID_API_KEY}",
+        "Authorization": f"Bearer {MAILERSEND_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    logger.info("Wysyłanie e-maila do %s przez SendGrid...", to_email)
+    logger.info("Wysyłanie e-maila do %s przez MailerSend...", to_email)
 
-    resp = requests.post(SENDGRID_API_URL, json=data, headers=headers, timeout=15)
+    resp = requests.post(MAILERSEND_API_URL, json=data, headers=headers, timeout=15)
 
     if resp.status_code >= 400:
         logger.error(
-            "Błąd SendGrid: %s – %s",
+            "Błąd MailerSend: %s – %s",
             resp.status_code,
             resp.text,
         )
@@ -124,7 +119,7 @@ def _build_giftcard_html(order_serial_number: str) -> str:
     """
     Buduje HTML dla maila z kartą podarunkową.
     Layout prosty, ale zgodny z wymaganiami:
-    - logotyp WASSYL
+    - logotyp MODBIS
     - treść po polsku
     - numer zamówienia (orderSerialNumber)
     """
@@ -142,13 +137,13 @@ def _build_giftcard_html(order_serial_number: str) -> str:
           <table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px; background:#ffffff; border-radius:12px; overflow:hidden; box-shadow:0 12px 30px rgba(15,23,42,0.08);">
             <tr>
               <td align="center" style="padding:24px 24px 16px 24px; border-bottom:1px solid #e5e7eb;">
-                <img src="https://wassyl.pl/data/include/cms/gfx/logo-wassyl.png" alt="WASSYL" style="display:block; max-width:180px; height:auto;" />
+                <img src="https://modbis.pl/data/gfx/mask/pol/logo_1_big.svg" alt="MODBIS" style="display:block; max-width:180px; height:auto;" />
               </td>
             </tr>
 
             <tr>
               <td style="padding:24px 24px 4px 24px; font-size:16px; font-weight:600; color:#111827;">
-                Dziękujemy za zakup karty podarunkowej WASSYL
+                Dziękujemy za zakup karty podarunkowej ModBiS
               </td>
             </tr>
             <tr>
@@ -172,7 +167,7 @@ def _build_giftcard_html(order_serial_number: str) -> str:
             <tr>
               <td style="padding:0 24px 12px 24px; font-size:14px; line-height:1.6; color:#4b5563;">
                 <strong>Jak skorzystać z karty?</strong><br/>
-                Podczas składania zamówienia w sklepie <a href="https://wassyl.pl" style="color:#4f46e5; text-decoration:none;">WASSYL.pl</a>
+                Podczas składania zamówienia w sklepie <a href="https://modbis.pl" style="color:#4f46e5; text-decoration:none;">ModBiS.pl</a>
                 wybierz metodę płatności „Karta podarunkowa” i wpisz numer karty podarunkowej z załączonego PDF.
               </td>
             </tr>
@@ -187,7 +182,7 @@ def _build_giftcard_html(order_serial_number: str) -> str:
             <tr>
               <td style="padding:0 24px 24px 24px; font-size:13px; color:#4b5563;">
                 Pozdrawiamy,<br/>
-                <strong>zespół WASSYL.pl</strong>
+                <strong>zespół ModBiS.pl</strong>
               </td>
             </tr>
 
@@ -198,14 +193,6 @@ def _build_giftcard_html(order_serial_number: str) -> str:
   </body>
 </html>
     """.strip()
-
-
-def build_giftcard_html(order_serial_number: str) -> str:
-    """
-    Publiczny helper – ten HTML możesz wykorzystać również w debug/test-email,
-    żeby testowy mail wyglądał identycznie jak produkcyjny.
-    """
-    return _build_giftcard_html(order_serial_number)
 
 
 # ------------------------------------------------------------------------------
@@ -221,7 +208,7 @@ def send_giftcard_email(
     """
     Wysyła maila z kartami podarunkowymi.
 
-    - generuje PDF dla każdej karty na bazie szablonu WASSYL-GIFTCARD.pdf
+    - generuje PDF dla każdej karty na bazie szablonu mdb-giftcard.pdf
     - dołącza wszystkie PDF-y jako załączniki
     - w treści maila umieszcza listę kart + numer zamówienia (orderSerialNumber)
     - opóźnia wysyłkę o 3 minuty (żeby najpierw przyszły maile ze sklepu)
@@ -259,20 +246,20 @@ def send_giftcard_email(
 
         # Generacja PDF dla każdej karty
         pdf_bytes = generate_giftcard_pdf(code=code, value=value)
-        filename = f"WASSYL-GIFTCARD-{value}zl-{code}.pdf"
+        filename = f"MODBIS-GIFTCARD-{value}zl-{code}.pdf"
         attachments.append((filename, pdf_bytes))
 
     lines.extend(
         [
             "",
             "Jak skorzystać z karty?",
-            "Wystarczy wybrać metodę płatności „Karta podarunkowa” w sklepie WASSYL.pl "
+            "Wystarczy wybrać metodę płatności „Karta podarunkowa” w sklepie MODBIS.pl "
             "i podać numer karty.",
             "",
             "W celu ułatwienia komunikacji podaj numer zamówienia:",
             f"Numer zamówienia: {order_serial_number}",
             "",
-            "Pozdrawiamy, zespół WASSYL.pl",
+            "Pozdrawiamy, zespół MODBIS.pl",
         ]
     )
 
