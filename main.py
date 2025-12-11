@@ -51,11 +51,12 @@ else:
     )
 
 # Stałe dla produktu karty podarunkowej
-GIFT_PRODUCT_ID = 14409
+GIFT_PRODUCT_ID = 41009
 GIFT_VARIANTS = {
     "100 zł": 100,
     "200 zł": 200,
     "300 zł": 300,
+    "400 zł": 300
     "500 zł": 500,
 }
 
@@ -1550,3 +1551,4 @@ def admin_list_logs(
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
+
