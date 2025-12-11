@@ -16,13 +16,23 @@ logger = logging.getLogger("giftcard-webhook")
 
 MAILERSEND_API_KEY: Optional[str] = os.getenv("MAILERSEND_API_KEY")
 
-# Wsparcie dla EMAIL_FROM (jak wcześniej przy SendGrid)
+# Adres nadawcy – obowiązkowy dla MailerSend
 FROM_EMAIL: str = os.getenv("EMAIL_FROM") or "vouchery@example.com"
+
+# Nazwa nadawcy
 FROM_NAME: str = (
     os.getenv("MAILERSEND_FROM_NAME")
-    or os.getenv("SENDGRID_FROM_NAME")  # backwards compatibility z istniejącym ENV
+    or os.getenv("SENDGRID_FROM_NAME")  # backward compatibility
     or "Giftcards"
 )
+
+# ------------------------------------------------------------------------------
+# Backwards compatibility (kod w main.py oczekuje tych zmiennych przy imporcie)
+# ------------------------------------------------------------------------------
+
+SENDGRID_API_KEY: Optional[str] = MAILERSEND_API_KEY
+SENDGRID_FROM_EMAIL: str = FROM_EMAIL
+SENDGRID_FROM_NAME: str = FROM_NAME
 
 MAILERSEND_API_URL = "https://api.mailersend.com/v1/email"
 
