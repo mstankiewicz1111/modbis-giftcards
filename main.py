@@ -56,7 +56,7 @@ GIFT_VARIANTS = {
     "100 zł": 100,
     "200 zł": 200,
     "300 zł": 300,
-    "400 zł": 300
+    "400 zł": 400
     "500 zł": 500,
 }
 
@@ -856,7 +856,7 @@ ADMIN_HTML = """
   <div class="app">
     <header>
       <div class="logo">
-        <img src="https://wassyl.pl/data/include/cms/gfx/logo-wassyl.png" alt="WASSYL" />
+        <img src="https://modbis.pl/data/include/cms/gfx/mdb-png.png" alt="WASSYL" />
         <div class="logo-title">
           Panel administracyjny kart podarunkowych
         </div>
@@ -896,6 +896,7 @@ ADMIN_HTML = """
             <option value="100">100 zł</option>
             <option value="200">200 zł</option>
             <option value="300">300 zł</option>
+            <option value="400">400 zł</option>
             <option value="500">500 zł</option>
           </select>
         </div>
@@ -939,6 +940,7 @@ ADMIN_HTML = """
                 <option value="100">100 zł</option>
                 <option value="200">200 zł</option>
                 <option value="300">300 zł</option>
+                <option value="400">400 zł</option>
                 <option value="500">500 zł</option>
               </select>
             </label>
@@ -1551,4 +1553,5 @@ def admin_list_logs(
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
+
 
