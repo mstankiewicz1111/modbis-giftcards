@@ -95,7 +95,11 @@ def _extract_giftcard_positions(order: Dict[str, Any]) -> List[Dict[str, Any]]:
         if product_id != GIFT_PRODUCT_ID:
             continue
 
-        variant_name = str(item.get("productName") or "")
+        variant_name = str(
+    item.get("sizePanelName")
+    or item.get("productName")
+    or ""
+)
         matched_value: Optional[int] = None
         for label, val in GIFT_VARIANTS.items():
             if label in variant_name:
@@ -1553,6 +1557,7 @@ def admin_list_logs(
         raise HTTPException(status_code=500, detail="Błąd bazy danych")
     finally:
         db.close()
+
 
 
 
